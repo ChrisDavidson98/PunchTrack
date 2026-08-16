@@ -65,12 +65,28 @@ function slugify(address) {
   return address.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
 }
 function newId() { return Math.random().toString(36).slice(2, 10); }
-function fmtDate(d) { return d ? new Date(d + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : ""; }
+
+// Google Sheets sometimes silently converts a plain "YYYY-MM-DD" string into
+// its own Date type, which then comes back from the backend as a full
+// timestamp like "2026-08-20T00:00:00.000Z" instead of a plain date string.
+// Always take just the first 10 chars (the actual date part) so parsing
+// works regardless of which form we get back.
+function parseLocalDate(d) {
+  if (!d) return null;
+  const datePart = String(d).slice(0, 10);
+  const parsed = new Date(datePart + "T00:00:00");
+  return isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function fmtDate(d) {
+  const parsed = parseLocalDate(d);
+  return parsed ? parsed.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "";
+}
 
 // Walk back N *working* days (Mon-Fri) from a date, skipping weekends.
 function workingDaysBefore(dateStr, n) {
-  if (!dateStr) return null;
-  let d = new Date(dateStr + "T00:00:00");
+  let d = parseLocalDate(dateStr);
+  if (!d) return null;
   let remaining = n;
   while (remaining > 0) {
     d.setDate(d.getDate() - 1);
