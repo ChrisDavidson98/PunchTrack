@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Walkthrough" />
+<title>Walkthrough Tracker</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Barlow+Condensed:wght@600;700;800&display=swap" rel="stylesheet" />
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; background: #08090a; -webkit-tap-highlight-color: transparent; }
+input, textarea, button, a { font-family: inherit; }
+input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(0.6); cursor: pointer; }
+textarea { outline: none; }
+button { outline: none; }
+::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-track { background: #08090a; } ::-webkit-scrollbar-thumb { background: #232a38; border-radius: 2px; }
+</style>
+</head>
+<body>
+<div id="root">Loading…</div>
+<script>
+window.addEventListener("error", function (e) {
+  var root = document.getElementById("root");
+  if (root) {
+    root.innerHTML =
+      '<div style="font-family:monospace;padding:20px;color:#8A4A16;background:#F4E3D3;white-space:pre-wrap;">' +
+      "SCRIPT ERROR:\n" + (e.message || e) + "\n\nFile: " + (e.filename || "?") + " Line: " + (e.lineno || "?") +
+      "</div>";
+  }
+});
+</script>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js" crossorigin></script>
+<script>
+setTimeout(function () {
+  var root = document.getElementById("root");
+  if (root && root.innerText.trim() === "Loading…") {
+    root.innerHTML =
+      '<div style="font-family:monospace;padding:20px;color:#8A4A16;background:#F4E3D3;">' +
+      "Still loading after 5 seconds — likely the React/Babel scripts from unpkg.com didn't load. " +
+      "Check your internet connection, or whether an ad blocker / firewall is blocking unpkg.com." +
+      "</div>";
+  }
+}, 5000);
+</script>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef } = React;
+
+// ════════════════════════════════════════════════════════════════
+// CONFIGURE — paste your Apps Script URL + token between the quotes
+// ════════════════════════════════════════════════════════════════
+const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzHpWKcsT9w01rxs4wzrtfI-G2dbrp6LsPkX3x_W2KR8AyLFVsaszQBwUh6f4l01wr74g/exec";
+const APP_TOKEN = "pWojP7euA3jW-E8XNYYr4TQZDPFfJxnh";
+// ════════════════════════════════════════════════════════════════
+
+function configured() {
+  return APPS_SCRIPT_URL !== "YOUR_SCRIPT_URL_HERE";
+}
+
+// ── Helpers ──────────────────────────────────────────────────────
+function slugify(address) {
+  return address.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+}
+function newId() { return Math.random().toString(36).slice(2, 10); }
+function fmtDate(d) { return d ? new Date(d + "T00:00:00").toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : ""; }
+
+// Walk back N *working* days (Mon-Fri) from a date, skipping weekends.
+function workingDaysBefore(dateStr, n) {
+  if (!dateStr) return null;
+  let d = new Date(dateStr + "T00:00:00");
+  let remaining = n;
+  while (remaining > 0) {
+    d.setDate(d.getDate() - 1);
+    const day = d.getDay(); // 0 = Sun, 6 = Sat
+    if (day !== 0 && day !== 6) remaining--;
+  }
+  return d.toISOString().slice(0, 10);
+}
+
+async function withRetry(fn, attempts = 3, delayMs = 400) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try { return await fn(); }
+    catch (e) { lastErr = e; if (i < attempts - 1) await new Promise(r => setTimeout(r, delayMs * (i + 1))); }
+  }
+  throw lastErr;
+}
+
+async function backendGet(params) {
+  const url = new URL(APPS_SCRIPT_URL);
+  Object.entries({ token: APP_TOKEN, ...params }).forEach(([k, v]) => url.searchParams.set(k, v));
+  const res = await fetch(url.toString());
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+async function backendPost(action, payload) {
+  const res = await fetch(APPS_SCRIPT_URL, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify({ action, token: APP_TOKEN, ...payload }),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error);
+  return data;
+}
+
+// ── Icons (minimal) ─────────────────────────────────────────────
+function Icon({ size = 16, strokeWidth = 2, style, children }) {
+  return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" style={style}>{children}</svg>;
+}
+const ArrowLeft = p => <Icon {...p}><line x1="19" y1="12" x2="5" y2="12" /><polyline points="12 19 5 12 12 5" /></Icon>;
+const Trash2 = p => <Icon {...p}><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2" /></Icon>;
+const Send = p => <Icon {...p}><line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" /></Icon>;
+const AlertTriangle = p => <Icon {...p}><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" /><line x1="12" y1="9" x2="12" y2="13" /><line x1="12" y1="17" x2="12.01" y2="17" /></Icon>;
+const CheckCircle2 = p => <Icon {...p}><path d="M21.8 10A10 10 0 1 1 17 3.3" /><polyline points="22 4 12 14.01 9 11.01" /></Icon>;
+
+// ── App shell ────────────────────────────────────────────────────
+function App() {
+  const [screen, setScreen] = useState("list"); // list | job | report
+  const [jobs, setJobs] = useState([]);
+  const [loadingJobs, setLoadingJobs] = useState(true);
+  const [activeSlug, setActiveSlug] = useState(null);
+  const [activeJob, setActiveJob] = useState(null);
+  const [jobLoading, setJobLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [reportAssignee, setReportAssignee] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      if (!configured()) { setLoadingJobs(false); return; }
+      try {
+        const result = await withRetry(() => backendGet({ action: "listJobs" }));
+        setJobs(result || []);
+      } catch (e) { setJobs([]); }
+      finally { setLoadingJobs(false); }
+    })();
+  }, []);
+
+  const loadJob = async (slug) => {
+    setJobLoading(true);
+    setError(null);
+    try {
+      const result = await withRetry(() => backendGet({ action: "getJob", slug }));
+      setActiveJob(result);
+    } catch (e) { setError("Couldn't load this job (" + e.message + ")."); }
+    finally { setJobLoading(false); }
+  };
+
+  const openJob = async (slug) => {
+    setActiveSlug(slug);
+    setScreen("job");
+    setError(null);
+    await loadJob(slug);
+  };
+
+  const createJob = async (address, closingDate) => {
+    const slug = slugify(address) + "-" + newId().slice(0, 4);
+    const job = { slug, address: address.trim(), closingDate: closingDate || "", createdAt: new Date().toISOString(), lastUpdated: new Date().toISOString() };
+    try { await withRetry(() => backendPost("createJob", { job })); }
+    catch (e) { setError("Couldn't create job."); return; }
+    setJobs([{ ...job }, ...jobs]);
+    await openJob(slug);
+  };
+
+  const deleteJob = async (slug, e) => {
+    e.stopPropagation();
+    if (!window.confirm("Delete this house's walkthrough data? This can't be undone.")) return;
+    try {
+      await withRetry(() => backendPost("deleteJob", { slug }));
+      setJobs(jobs.filter(j => j.slug !== slug));
+    } catch (e) { setError("Couldn't delete job."); }
+  };
+
+  const refreshActiveJob = async () => { if (activeSlug) await loadJob(activeSlug); };
+
+  const openReport = (assignee) => { setReportAssignee(assignee); setScreen("report"); };
+
+  return (
+    <div style={S.app}>
+      <div style={S.body}>
+        {!configured() && (
+          <div style={S.banner}>
+            ⚙ Open <strong>index.html</strong> and replace <code>YOUR_SCRIPT_URL_HERE</code> / <code>YOUR_APP_TOKEN_HERE</code> with your Apps Script deployment URL and token to enable syncing.
+          </div>
+        )}
+        {error && <div style={S.errBanner}>{error}</div>}
+
+        {screen === "list" && (
+          <JobList jobs={jobs} loading={loadingJobs} onOpen={openJob} onCreate={createJob} onDelete={deleteJob} />
+        )}
+        {screen === "job" && (
+          jobLoading || !activeJob
+            ? <div style={S.loading}>LOADING…</div>
+            : <JobScreen
+                job={activeJob}
+                onBack={() => { setScreen("list"); setActiveJob(null); }}
+                onRefresh={refreshActiveJob}
+                onOpenReport={openReport}
+                setError={setError}
+              />
+        )}
+        {screen === "report" && activeJob && (
+          <ReportScreen job={activeJob} assignee={reportAssignee} onBack={() => setScreen("job")} onShipped={refreshActiveJob} setError={setError} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Job list ─────────────────────────────────────────────────────
+function JobList({ jobs, loading, onOpen, onCreate, onDelete }) {
+  const [showAdd, setShowAdd] = useState(false);
+  const [addr, setAddr] = useState("");
+  const [closing, setClosing] = useState("");
+
+  const go = () => { if (addr.trim()) { onCreate(addr, closing); setAddr(""); setClosing(""); setShowAdd(false); } };
+
+  return (
+    <div>
+      <div style={S.ph}>
+        <h1 style={S.pt}>Walkthrough Tracker <span style={S.dc}>{jobs.length}</span></h1>
+        <button style={S.pBtn} onClick={() => setShowAdd(true)}>+ NEW HOUSE</button>
+      </div>
+      {loading && <div style={S.loading}>LOADING…</div>}
+      {!loading && jobs.length === 0 && <Empty icon="🚶" text="No houses yet. Tap + NEW HOUSE to start a walkthrough." />}
+      <div style={S.stack}>
+        {jobs.map(j => (
+          <div key={j.slug} style={S.card} onClick={() => onOpen(j.slug)}>
+            <div style={S.cardRow}>
+              <div style={{ flex: 1 }}>
+                <div style={S.addr}>{j.address}</div>
+                {j.closingDate && <div style={S.metaTxt}>Closing {fmtDate(j.closingDate)}</div>}
+              </div>
+              <button style={S.iconBtn} onClick={(e) => onDelete(j.slug, e)}><Trash2 size={14} /></button>
+            </div>
+          </div>
+        ))}
+      </div>
+      {showAdd && (
+        <Overlay title="New House">
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            <div>
+              <label style={S.fLbl}>ADDRESS</label>
+              <input style={S.tIn} placeholder="Street address…" value={addr} onChange={e => setAddr(e.target.value)} autoFocus />
+            </div>
+            <div>
+              <label style={S.fLbl}>CLOSING DATE (optional — can also be dictated)</label>
+              <input type="date" style={S.tIn} value={closing} onChange={e => setClosing(e.target.value)} />
+            </div>
+          </div>
+          <div style={{ ...S.mBtns, marginTop: 20 }}>
+            <button style={S.gBtn} onClick={() => setShowAdd(false)}>CANCEL</button>
+            <button style={{ ...S.pBtn, opacity: addr.trim() ? 1 : 0.4 }} onClick={go}>CREATE</button>
+          </div>
+        </Overlay>
+      )}
+    </div>
+  );
+}
+
+// ── Job screen: dictate, review, ship ─────────────────────────────
+function JobScreen({ job, onBack, onRefresh, onOpenReport, setError }) {
+  const [dictation, setDictation] = useState("");
+  const [processing, setProcessing] = useState(false);
+  const [pendingItems, setPendingItems] = useState(null); // null = not reviewing; array = reviewing
+  const [pendingClosingDate, setPendingClosingDate] = useState(null);
+
+  const items = job.items || [];
+  const assignable = items.filter(it => it.status === "assignable" || it.status === "sent");
+  const flagged = items.filter(it => it.status === "flagged");
+  const selfAssigned = items.filter(it => it.status === "self_assigned");
+
+  const byAssignee = {};
+  assignable.forEach(it => { (byAssignee[it.assignee] = byAssignee[it.assignee] || []).push(it); });
+
+  const processDictation = async () => {
+    if (!dictation.trim()) return;
+    setProcessing(true);
+    setError(null);
+    try {
+      const result = await withRetry(() => backendPost("parseDictation", { dictation }));
+      setPendingItems(result.items || []);
+      setPendingClosingDate(result.closingDate || null);
+    } catch (e) {
+      setError("Couldn't process dictation (" + e.message + ").");
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  const updatePendingItem = (id, field, value) => {
+    setPendingItems(prev => prev.map(it => it.id === id ? { ...it, [field]: value } : it));
+  };
+  const removePendingItem = (id) => setPendingItems(prev => prev.filter(it => it.id !== id));
+
+  const confirmAndSave = async () => {
+    setProcessing(true);
+    setError(null);
+    try {
+      const merged = items.concat(pendingItems);
+      await withRetry(() => backendPost("saveItems", { slug: job.slug, items: merged }));
+      if (pendingClosingDate && !job.closingDate) {
+        await withRetry(() => backendPost("saveJob", { job: { ...job, closingDate: pendingClosingDate } }));
+      }
+      setPendingItems(null);
+      setPendingClosingDate(null);
+      setDictation("");
+      await onRefresh();
+    } catch (e) {
+      setError("Couldn't save items (" + e.message + ").");
+    } finally {
+      setProcessing(false);
+    }
+  };
+
+  const resolveFlaggedItem = async (item, newAssignee) => {
+    setError(null);
+    try {
+      await withRetry(() => backendPost("resolveFlag", { itemId: item.id, resolution: { newAssignee, newStatus: "assignable" } }));
+      await onRefresh();
+    } catch (e) { setError("Couldn't resolve item (" + e.message + ")."); }
+  };
+
+  return (
+    <div>
+      <div style={S.ph}>
+        <button style={S.gBtn} onClick={onBack}><ArrowLeft size={12} /> BACK</button>
+      </div>
+      <div style={S.dAddr}>{job.address}</div>
+      {job.closingDate && <div style={S.metaTxt}>Closing {fmtDate(job.closingDate)}</div>}
+
+      <div style={S.div} />
+
+      {pendingItems === null ? (
+        <>
+          <div style={S.secLbl}>DICTATE WALKTHROUGH</div>
+          <textarea
+            style={S.dictateArea}
+            rows={6}
+            placeholder="Use your phone's mic-to-text, then paste or dictate directly here. Mention the closing date first if not already set, then room, item, assignee for each thing you find…"
+            value={dictation}
+            onChange={e => setDictation(e.target.value)}
+          />
+          <button style={{ ...S.pBtn, width: "100%", marginTop: 10, opacity: dictation.trim() && !processing ? 1 : 0.4 }} onClick={processDictation} disabled={!dictation.trim() || processing}>
+            {processing ? "PROCESSING…" : "PROCESS DICTATION"}
+          </button>
+
+          <div style={S.div} />
+
+          {flagged.length > 0 && (
+            <>
+              <div style={S.secLbl}><AlertTriangle size={11} style={{ marginRight: 4, verticalAlign: -1 }} />NEEDS MY FOLLOW-UP ({flagged.length})</div>
+              <div style={{ ...S.stack, marginBottom: 24 }}>
+                {flagged.map(it => <FlaggedRow key={it.id} item={it} onResolve={resolveFlaggedItem} />)}
+              </div>
+            </>
+          )}
+
+          {selfAssigned.length > 0 && (
+            <>
+              <div style={S.secLbl}>INTERNAL FOLLOW-UP (CHRIS — NO EMAIL NEEDED)</div>
+              <div style={{ ...S.stack, marginBottom: 24 }}>
+                {selfAssigned.map(it => (
+                  <div key={it.id} style={S.itemRow}>
+                    <div style={S.itemText}>{it.room}: {it.item}</div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+
+          <div style={S.secLbl}>ASSIGNEES ({Object.keys(byAssignee).length})</div>
+          {Object.keys(byAssignee).length === 0 && <Empty icon="📋" text="No assignable items yet. Dictate a walkthrough above." />}
+          <div style={S.stack}>
+            {Object.entries(byAssignee).map(([assignee, its]) => {
+              const allSent = its.every(it => it.status === "sent");
+              return (
+                <div key={assignee} style={S.card} onClick={() => onOpenReport(assignee)}>
+                  <div style={S.cardRow}>
+                    <div style={{ flex: 1 }}>
+                      <div style={S.addr}>{assignee}</div>
+                      <div style={S.metaTxt}>{its.length} item{its.length > 1 ? "s" : ""}</div>
+                    </div>
+                    {allSent ? <span style={{ color: "#4ade80", fontSize: 11 }}><CheckCircle2 size={14} /></span> : <Badge color="amber">PENDING</Badge>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      ) : (
+        <ReviewPending
+          items={pendingItems}
+          closingDate={pendingClosingDate}
+          onUpdate={updatePendingItem}
+          onRemove={removePendingItem}
+          onConfirm={confirmAndSave}
+          onCancel={() => { setPendingItems(null); setPendingClosingDate(null); }}
+          processing={processing}
+        />
+      )}
+    </div>
+  );
+}
+
+function FlaggedRow({ item, onResolve }) {
+  const [reassign, setReassign] = useState("");
+  return (
+    <div style={{ ...S.itemRow, borderColor: "rgba(245,158,11,0.3)", backgroundColor: "rgba(245,158,11,0.05)" }}>
+      <div style={S.itemText}>{item.room}: {item.item}</div>
+      <div style={S.metaTxt}>Currently: {item.assignee}</div>
+      <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+        <input style={{ ...S.tIn, flex: 1 }} placeholder="Reassign to…" value={reassign} onChange={e => setReassign(e.target.value)} />
+        <button style={S.gBtn} disabled={!reassign.trim()} onClick={() => onResolve(item, reassign.trim())}>RESOLVE</button>
+      </div>
+    </div>
+  );
+}
+
+function ReviewPending({ items, closingDate, onUpdate, onRemove, onConfirm, onCancel, processing }) {
+  return (
+    <div>
+      <div style={S.secLbl}>REVIEW BEFORE SAVING</div>
+      {closingDate && <div style={{ ...S.metaTxt, marginBottom: 12 }}>Detected closing date: {fmtDate(closingDate)}</div>}
+      <div style={{ ...S.stack, marginBottom: 20 }}>
+        {items.map(it => (
+          <div key={it.id} style={S.reviewRow}>
+            <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+              <input style={{ ...S.tIn, flex: 1 }} value={it.room} onChange={e => onUpdate(it.id, "room", e.target.value)} placeholder="Room" />
+              <button style={S.iconBtn} onClick={() => onRemove(it.id)}><Trash2 size={13} /></button>
+            </div>
+            <input style={{ ...S.tIn, marginBottom: 6 }} value={it.item} onChange={e => onUpdate(it.id, "item", e.target.value)} placeholder="Item" />
+            <div style={{ display: "flex", gap: 6 }}>
+              <input style={{ ...S.tIn, flex: 1 }} value={it.assignee} onChange={e => onUpdate(it.id, "assignee", e.target.value)} placeholder="Assignee" />
+              <select style={S.tIn} value={it.status} onChange={e => onUpdate(it.id, "status", e.target.value)}>
+                <option value="assignable">Assignable</option>
+                <option value="flagged">Flagged</option>
+                <option value="self_assigned">Self (Chris)</option>
+              </select>
+            </div>
+          </div>
+        ))}
+      </div>
+      <div style={S.mBtns}>
+        <button style={S.gBtn} onClick={onCancel}>CANCEL</button>
+        <button style={{ ...S.pBtn, opacity: processing ? 0.5 : 1 }} onClick={onConfirm} disabled={processing}>{processing ? "SAVING…" : "SAVE ITEMS"}</button>
+      </div>
+    </div>
+  );
+}
+
+// ── Report screen ────────────────────────────────────────────────
+function ReportScreen({ job, assignee, onBack, onShipped, setError }) {
+  const [shipping, setShipping] = useState(false);
+  const items = (job.items || []).filter(it => it.assignee === assignee);
+  const deadline = job.closingDate ? workingDaysBefore(job.closingDate, 2) : null;
+  const allSent = items.length > 0 && items.every(it => it.status === "sent");
+
+  const reportText = [
+    `Good morning. Can you please have the below listed items completed at the above address${deadline ? ` prior to ${fmtDate(deadline)}` : ""}.`,
+    "",
+    ...items.map(it => `• ${it.room}: ${it.item}`),
+  ].join("\n");
+
+  const copyReport = () => {
+    navigator.clipboard.writeText(`${job.address}\n\n${reportText}`);
+  };
+
+  const ship = async () => {
+    setShipping(true);
+    setError(null);
+    try {
+      await withRetry(() => backendPost("shipReport", { slug: job.slug, assignee }));
+      await onShipped();
+    } catch (e) { setError("Couldn't mark report as sent (" + e.message + ")."); }
+    finally { setShipping(false); }
+  };
+
+  return (
+    <div>
+      <div style={S.ph}>
+        <button style={S.gBtn} onClick={onBack}><ArrowLeft size={12} /> BACK</button>
+        <button style={S.gBtn} onClick={copyReport}>COPY</button>
+      </div>
+      <div style={S.dAddr}>{assignee}</div>
+      <div style={S.metaTxt}>{job.address}{deadline ? ` · Due ${fmtDate(deadline)}` : ""}</div>
+
+      <div style={S.div} />
+
+      <div style={S.reportBox}>
+        <pre style={S.reportPre}>{reportText}</pre>
+      </div>
+
+      <div style={{ marginTop: 20 }}>
+        {allSent ? (
+          <div style={{ ...S.metaTxt, color: "#4ade80" }}><CheckCircle2 size={13} style={{ marginRight: 4, verticalAlign: -2 }} />Sent</div>
+        ) : (
+          <button style={{ ...S.pBtn, width: "100%", opacity: shipping ? 0.5 : 1 }} onClick={ship} disabled={shipping}>
+            <Send size={13} style={{ marginRight: 6, verticalAlign: -2 }} />{shipping ? "MARKING SENT…" : "MARK AS SENT"}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── UI primitives ────────────────────────────────────────────────
+function Badge({ color, children }) {
+  const c = {
+    amber: { bg: "rgba(245,158,11,0.12)", t: "#fbbf24", b: "rgba(245,158,11,0.25)" },
+    green: { bg: "rgba(34,197,94,0.12)", t: "#4ade80", b: "rgba(34,197,94,0.25)" },
+  }[color] || { bg: "rgba(92,122,153,0.15)", t: "#5c7a99", b: "rgba(92,122,153,0.3)" };
+  return <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: "0.08em", padding: "2px 7px", borderRadius: 3, backgroundColor: c.bg, color: c.t, border: `1px solid ${c.b}` }}>{children}</span>;
+}
+function Empty({ icon, text }) {
+  return <div style={{ textAlign: "center", padding: "60px 20px" }}>
+    <div style={{ fontSize: 44, marginBottom: 12 }}>{icon}</div>
+    <div style={{ color: "#4b5563", fontSize: 13 }}>{text}</div>
+  </div>;
+}
+function Overlay({ title, children }) {
+  return <div style={S.overlay}><div style={S.modal}><div style={S.modalTitle}>{title}</div>{children}</div></div>;
+}
+
+// ── Styles ───────────────────────────────────────────────────────
+const S = {
+  app: { minHeight: "100vh", backgroundColor: "#08090a", color: "#e5e7eb", fontFamily: "'DM Mono','Courier New',monospace" },
+  body: { padding: "20px 16px", maxWidth: 760, margin: "0 auto" },
+  ph: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20, gap: 8 },
+  pt: { fontFamily: "'Barlow Condensed',sans-serif", fontSize: 26, fontWeight: 700, color: "#f3f4f6", letterSpacing: "0.05em", margin: 0 },
+  dc: { fontSize: 16, color: "#4b5563", marginLeft: 8 },
+  pBtn: { backgroundColor: "#5c7a99", color: "#08090a", border: "none", padding: "9px 18px", borderRadius: 4, fontSize: 11, fontWeight: 700, letterSpacing: "0.12em", cursor: "pointer", fontFamily: "'DM Mono',monospace" },
+  gBtn: { background: "none", border: "1px solid #232a38", color: "#9ca3af", padding: "7px 14px", borderRadius: 4, fontSize: 11, letterSpacing: "0.1em", cursor: "pointer", fontFamily: "'DM Mono',monospace", display: "flex", alignItems: "center", gap: 4 },
+  iconBtn: { background: "none", border: "1px solid #232a38", color: "#6b7280", borderRadius: 4, width: 26, height: 26, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" },
+  stack: { display: "flex", flexDirection: "column", gap: 8 },
+  card: { backgroundColor: "#0f131b", border: "1px solid #1c2230", borderRadius: 8, padding: 14, cursor: "pointer" },
+  cardRow: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 },
+  addr: { fontSize: 14, fontWeight: 500, color: "#f3f4f6", lineHeight: 1.3 },
+  metaTxt: { fontSize: 10, color: "#6b7280", letterSpacing: "0.05em", marginTop: 3 },
+  dAddr: { fontFamily: "'Barlow Condensed',sans-serif", fontSize: 26, fontWeight: 700, color: "#f3f4f6", letterSpacing: "0.03em", marginBottom: 2, lineHeight: 1.2 },
+  div: { height: 1, backgroundColor: "#1c2230", margin: "20px 0" },
+  secLbl: { fontSize: 10, color: "#6b7280", letterSpacing: "0.15em", marginBottom: 10, fontWeight: 700 },
+  dictateArea: { width: "100%", backgroundColor: "#08090a", border: "1px solid #232a38", borderRadius: 6, color: "#d1d5db", padding: "12px 14px", fontSize: 13, fontFamily: "'DM Mono',monospace", resize: "vertical", boxSizing: "border-box", lineHeight: 1.5 },
+  itemRow: { backgroundColor: "#0f131b", border: "1px solid #1c2230", borderRadius: 6, padding: "10px 12px" },
+  itemText: { fontSize: 12, color: "#e5e7eb" },
+  reviewRow: { backgroundColor: "#0f131b", border: "1px solid #1c2230", borderRadius: 6, padding: 12 },
+  tIn: { backgroundColor: "#08090a", border: "1px solid #232a38", borderRadius: 6, color: "#f3f4f6", padding: "8px 10px", fontSize: 12, fontFamily: "'DM Mono',monospace", boxSizing: "border-box", colorScheme: "dark" },
+  fLbl: { fontSize: 9, color: "#6b7280", letterSpacing: "0.12em", display: "block", marginBottom: 4 },
+  mBtns: { display: "flex", gap: 10, justifyContent: "flex-end" },
+  reportBox: { backgroundColor: "#0f131b", border: "1px solid #1c2230", borderRadius: 8, padding: 16 },
+  reportPre: { whiteSpace: "pre-wrap", fontSize: 12, color: "#d1d5db", lineHeight: 1.7, fontFamily: "'DM Mono',monospace" },
+  loading: { textAlign: "center", padding: 40, color: "#5c7a99", letterSpacing: "0.1em", fontSize: 12 },
+  banner: { backgroundColor: "rgba(245,158,11,0.08)", border: "1px solid rgba(245,158,11,0.2)", borderRadius: 6, padding: "10px 14px", fontSize: 11, color: "#fbbf24", marginBottom: 16, lineHeight: 1.6 },
+  errBanner: { backgroundColor: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.2)", borderRadius: 6, padding: "10px 14px", fontSize: 11, color: "#f87171", marginBottom: 16 },
+  overlay: { position: "fixed", inset: 0, backgroundColor: "rgba(0,0,0,0.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200, padding: 20 },
+  modal: { backgroundColor: "#0f131b", border: "1px solid #232a38", borderRadius: 10, padding: 24, width: "100%", maxWidth: 400 },
+  modalTitle: { fontFamily: "'Barlow Condensed',sans-serif", fontSize: 22, fontWeight: 700, color: "#f3f4f6", letterSpacing: "0.05em", marginBottom: 16 },
+};
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
