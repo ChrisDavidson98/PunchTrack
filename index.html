@@ -301,14 +301,19 @@ function JobScreen({ job, onBack, onRefresh, onOpenReport, setError }) {
   const [processing, setProcessing] = useState(false);
   const [pendingItems, setPendingItems] = useState(null); // null = not reviewing; array = reviewing
   const [pendingClosingDate, setPendingClosingDate] = useState(null);
+  const [confirmDictation, setConfirmDictation] = useState("");
+  const [confirmProcessing, setConfirmProcessing] = useState(false);
+  const [pendingConfirmations, setPendingConfirmations] = useState(null); // { matches, unmatched } while reviewing
+  const [expandedAssignee, setExpandedAssignee] = useState(null);
 
   const items = job.items || [];
-  const assignable = items.filter(it => it.status === "assignable" || it.status === "sent");
+  const openItems = items.filter(it => it.status === "assignable" || it.status === "sent");
   const flagged = items.filter(it => it.status === "flagged");
-  const selfAssigned = items.filter(it => it.status === "self_assigned");
+  const selfAssignedOpen = items.filter(it => it.status === "self_assigned");
+  const completed = items.filter(it => it.status === "completed");
 
   const byAssignee = {};
-  assignable.forEach(it => { (byAssignee[it.assignee] = byAssignee[it.assignee] || []).push(it); });
+  openItems.forEach(it => { (byAssignee[it.assignee] = byAssignee[it.assignee] || []).push(it); });
 
   const processDictation = async () => {
     if (!dictation.trim()) return;
@@ -358,6 +363,59 @@ function JobScreen({ job, onBack, onRefresh, onOpenReport, setError }) {
     } catch (e) { setError("Couldn't resolve item (" + e.message + ")."); }
   };
 
+  const saveItemEdit = async (item) => {
+    setError(null);
+    try {
+      await withRetry(() => backendPost("updateItem", { item }));
+      await onRefresh();
+    } catch (e) { setError("Couldn't save edit (" + e.message + ")."); }
+  };
+
+  const markComplete = async (item) => {
+    setError(null);
+    try {
+      await withRetry(() => backendPost("updateItem", { item: { id: item.id, status: "completed", dateCompleted: new Date().toISOString() } }));
+      await onRefresh();
+    } catch (e) { setError("Couldn't mark complete (" + e.message + ")."); }
+  };
+
+  const processConfirmation = async () => {
+    if (!confirmDictation.trim()) return;
+    setConfirmProcessing(true);
+    setError(null);
+    try {
+      const openItemsForMatch = openItems.map(it => ({ id: it.id, room: it.room, item: it.item }));
+      const result = await withRetry(() => backendPost("parseConfirmation", { dictation: confirmDictation, openItems: openItemsForMatch }));
+      setPendingConfirmations(result);
+    } catch (e) {
+      setError("Couldn't process confirmation (" + e.message + ").");
+    } finally {
+      setConfirmProcessing(false);
+    }
+  };
+
+  const updatePendingMatch = (id, field, value) => {
+    setPendingConfirmations(prev => ({ ...prev, matches: prev.matches.map(m => m.id === id ? { ...m, [field]: value } : m) }));
+  };
+  const removePendingMatch = (id) => {
+    setPendingConfirmations(prev => ({ ...prev, matches: prev.matches.filter(m => m.id !== id) }));
+  };
+
+  const applyConfirmations = async () => {
+    setConfirmProcessing(true);
+    setError(null);
+    try {
+      await withRetry(() => backendPost("applyConfirmations", { matches: pendingConfirmations.matches }));
+      setPendingConfirmations(null);
+      setConfirmDictation("");
+      await onRefresh();
+    } catch (e) {
+      setError("Couldn't apply confirmations (" + e.message + ").");
+    } finally {
+      setConfirmProcessing(false);
+    }
+  };
+
   return (
     <div>
       <div style={S.ph}>
@@ -368,7 +426,7 @@ function JobScreen({ job, onBack, onRefresh, onOpenReport, setError }) {
 
       <div style={S.div} />
 
-      {pendingItems === null ? (
+      {pendingItems === null && pendingConfirmations === null ? (
         <>
           <div style={S.secLbl}>DICTATE WALKTHROUGH</div>
           <textarea
@@ -384,6 +442,20 @@ function JobScreen({ job, onBack, onRefresh, onOpenReport, setError }) {
 
           <div style={S.div} />
 
+          <div style={S.secLbl}>CONFIRM PASS (revisit updates)</div>
+          <textarea
+            style={S.dictateArea}
+            rows={4}
+            placeholder="Dictate what you found on a revisit — what's done, what's still pending with any new context…"
+            value={confirmDictation}
+            onChange={e => setConfirmDictation(e.target.value)}
+          />
+          <button style={{ ...S.gBtn, width: "100%", marginTop: 10, justifyContent: "center", opacity: confirmDictation.trim() && !confirmProcessing ? 1 : 0.4 }} onClick={processConfirmation} disabled={!confirmDictation.trim() || confirmProcessing}>
+            {confirmProcessing ? "PROCESSING…" : "PROCESS CONFIRMATION"}
+          </button>
+
+          <div style={S.div} />
+
           {flagged.length > 0 && (
             <>
               <div style={S.secLbl}><AlertTriangle size={11} style={{ marginRight: 4, verticalAlign: -1 }} />NEEDS MY FOLLOW-UP ({flagged.length})</div>
@@ -393,38 +465,66 @@ function JobScreen({ job, onBack, onRefresh, onOpenReport, setError }) {
             </>
           )}
 
-          {selfAssigned.length > 0 && (
+          {selfAssignedOpen.length > 0 && (
             <>
               <div style={S.secLbl}>INTERNAL FOLLOW-UP (CHRIS — NO EMAIL NEEDED)</div>
               <div style={{ ...S.stack, marginBottom: 24 }}>
-                {selfAssigned.map(it => (
-                  <div key={it.id} style={S.itemRow}>
-                    <div style={S.itemText}>{it.room}: {it.item}</div>
-                  </div>
+                {selfAssignedOpen.map(it => (
+                  <ItemRow key={it.id} item={it} onSave={saveItemEdit} onComplete={markComplete} showAssignee={false} />
                 ))}
               </div>
             </>
           )}
 
-          <div style={S.secLbl}>ASSIGNEES ({Object.keys(byAssignee).length})</div>
-          {Object.keys(byAssignee).length === 0 && <Empty icon="📋" text="No assignable items yet. Dictate a walkthrough above." />}
+          <div style={S.secLbl}>OPEN ITEMS ({Object.keys(byAssignee).length} assignee{Object.keys(byAssignee).length !== 1 ? "s" : ""})</div>
+          {Object.keys(byAssignee).length === 0 && <Empty icon="📋" text="No open items yet. Dictate a walkthrough above." />}
           <div style={S.stack}>
             {Object.entries(byAssignee).map(([assignee, its]) => {
               const allSent = its.every(it => it.status === "sent");
+              const expanded = expandedAssignee === assignee;
               return (
-                <div key={assignee} style={S.card} onClick={() => onOpenReport(assignee)}>
-                  <div style={S.cardRow}>
-                    <div style={{ flex: 1 }}>
+                <div key={assignee} style={S.card}>
+                  <div style={S.cardRow} onClick={() => setExpandedAssignee(expanded ? null : assignee)}>
+                    <div style={{ flex: 1, cursor: "pointer" }}>
                       <div style={S.addr}>{assignee}</div>
                       <div style={S.metaTxt}>{its.length} item{its.length > 1 ? "s" : ""}</div>
                     </div>
                     {allSent ? <span style={{ color: "#4ade80", fontSize: 11 }}><CheckCircle2 size={14} /></span> : <Badge color="amber">PENDING</Badge>}
                   </div>
+                  {expanded && (
+                    <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+                      {its.map(it => <ItemRow key={it.id} item={it} onSave={saveItemEdit} onComplete={markComplete} showAssignee={true} />)}
+                      <button style={{ ...S.gBtn, justifyContent: "center" }} onClick={() => onOpenReport(assignee)}>VIEW REPORT →</button>
+                    </div>
+                  )}
                 </div>
               );
             })}
           </div>
+
+          {completed.length > 0 && (
+            <>
+              <div style={{ ...S.secLbl, marginTop: 24 }}>COMPLETED ({completed.length})</div>
+              <div style={S.stack}>
+                {completed.map(it => (
+                  <div key={it.id} style={{ ...S.itemRow, opacity: 0.6 }}>
+                    <div style={S.itemText}>{it.room}: {it.item} <span style={{ color: "#6b7280" }}>· {it.assignee}</span></div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
         </>
+      ) : pendingConfirmations !== null ? (
+        <ReviewConfirmations
+          confirmations={pendingConfirmations}
+          openItems={openItems}
+          onUpdate={updatePendingMatch}
+          onRemove={removePendingMatch}
+          onApply={applyConfirmations}
+          onCancel={() => { setPendingConfirmations(null); }}
+          processing={confirmProcessing}
+        />
       ) : (
         <ReviewPending
           items={pendingItems}
@@ -436,6 +536,86 @@ function JobScreen({ job, onBack, onRefresh, onOpenReport, setError }) {
           processing={processing}
         />
       )}
+    </div>
+  );
+}
+
+function ItemRow({ item, onSave, onComplete, showAssignee }) {
+  const [editing, setEditing] = useState(false);
+  const [room, setRoom] = useState(item.room);
+  const [text, setText] = useState(item.item);
+  const [assignee, setAssignee] = useState(item.assignee);
+
+  const save = () => { onSave({ ...item, room, item: text, assignee }); setEditing(false); };
+  const cancel = () => { setRoom(item.room); setText(item.item); setAssignee(item.assignee); setEditing(false); };
+
+  if (editing) {
+    return (
+      <div style={S.reviewRow}>
+        <input style={{ ...S.tIn, marginBottom: 6, width: "100%" }} value={room} onChange={e => setRoom(e.target.value)} placeholder="Room" />
+        <input style={{ ...S.tIn, marginBottom: 6, width: "100%" }} value={text} onChange={e => setText(e.target.value)} placeholder="Item" />
+        {showAssignee && <input style={{ ...S.tIn, marginBottom: 8, width: "100%" }} value={assignee} onChange={e => setAssignee(e.target.value)} placeholder="Assignee" />}
+        <div style={{ display: "flex", gap: 6 }}>
+          <button style={S.gBtn} onClick={cancel}>CANCEL</button>
+          <button style={S.pBtn} onClick={save}>SAVE</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={S.itemRow}>
+      <div style={S.itemText}>{item.room}: {item.item}</div>
+      {item.notes && <div style={{ ...S.metaTxt, fontStyle: "italic" }}>{item.notes}</div>}
+      <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+        <button style={S.gBtn} onClick={() => setEditing(true)}>EDIT</button>
+        <button style={{ ...S.gBtn, color: "#4ade80", borderColor: "rgba(34,197,94,0.35)" }} onClick={() => onComplete(item)}><CheckCircle2 size={12} /> COMPLETE</button>
+      </div>
+    </div>
+  );
+}
+
+function ReviewConfirmations({ confirmations, openItems, onUpdate, onRemove, onApply, onCancel, processing }) {
+  const itemById = {};
+  openItems.forEach(it => { itemById[it.id] = it; });
+  return (
+    <div>
+      <div style={S.secLbl}>REVIEW CONFIRMATION MATCHES</div>
+      <div style={{ ...S.stack, marginBottom: 16 }}>
+        {confirmations.matches.map(m => {
+          const it = itemById[m.id];
+          return (
+            <div key={m.id} style={S.reviewRow}>
+              <div style={S.itemText}>{it ? `${it.room}: ${it.item}` : m.id}</div>
+              <div style={{ display: "flex", gap: 6, margin: "8px 0 6px" }}>
+                <select style={S.tIn} value={m.action} onChange={e => onUpdate(m.id, "action", e.target.value)}>
+                  <option value="complete">Mark Complete</option>
+                  <option value="note">Add Note Only</option>
+                </select>
+                <button style={S.iconBtn} onClick={() => onRemove(m.id)}><Trash2 size={13} /></button>
+              </div>
+              <input style={{ ...S.tIn, width: "100%" }} value={m.note || ""} onChange={e => onUpdate(m.id, "note", e.target.value)} placeholder="Note (optional)" />
+            </div>
+          );
+        })}
+        {confirmations.matches.length === 0 && <div style={S.metaTxt}>No confident matches found.</div>}
+      </div>
+      {confirmations.unmatched && confirmations.unmatched.length > 0 && (
+        <>
+          <div style={S.secLbl}>COULDN'T CONFIDENTLY MATCH</div>
+          <div style={{ ...S.stack, marginBottom: 16 }}>
+            {confirmations.unmatched.map((u, i) => (
+              <div key={i} style={{ ...S.itemRow, borderColor: "rgba(245,158,11,0.3)" }}>
+                <div style={S.itemText}>{u}</div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+      <div style={S.mBtns}>
+        <button style={S.gBtn} onClick={onCancel}>CANCEL</button>
+        <button style={{ ...S.pBtn, opacity: processing ? 0.5 : 1 }} onClick={onApply} disabled={processing || confirmations.matches.length === 0}>{processing ? "APPLYING…" : "APPLY"}</button>
+      </div>
     </div>
   );
 }
