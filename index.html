@@ -193,6 +193,23 @@ function App() {
 
   const refreshActiveJob = async () => { if (activeSlug) await loadJob(activeSlug); };
 
+  // Updates the active job's items in place, no network round-trip — used right
+  // after a write we already know succeeded, so the screen updates instantly.
+  const markSentLocally = (assignee) => {
+    setActiveJob(prev => {
+      if (!prev) return prev;
+      const now = new Date().toISOString();
+      return {
+        ...prev,
+        items: prev.items.map(it =>
+          it.assignee === assignee && it.status === "assignable"
+            ? { ...it, status: "sent", dateSent: now }
+            : it
+        ),
+      };
+    });
+  };
+
   const openReport = (assignee) => { setReportAssignee(assignee); setScreen("report"); };
 
   return (
@@ -220,7 +237,7 @@ function App() {
               />
         )}
         {screen === "report" && activeJob && (
-          <ReportScreen job={activeJob} assignee={reportAssignee} onBack={() => setScreen("job")} onShipped={refreshActiveJob} setError={setError} />
+          <ReportScreen job={activeJob} assignee={reportAssignee} onBack={() => setScreen("job")} onShipped={() => markSentLocally(reportAssignee)} setError={setError} />
         )}
       </div>
     </div>
@@ -472,6 +489,7 @@ function ReviewPending({ items, closingDate, onUpdate, onRemove, onConfirm, onCa
 // ── Report screen ────────────────────────────────────────────────
 function ReportScreen({ job, assignee, onBack, onShipped, setError }) {
   const [shipping, setShipping] = useState(false);
+  const [copied, setCopied] = useState(false);
   const items = (job.items || []).filter(it => it.assignee === assignee);
   const deadline = job.closingDate ? workingDaysBefore(job.closingDate, 2) : null;
   const allSent = items.length > 0 && items.every(it => it.status === "sent");
@@ -483,7 +501,9 @@ function ReportScreen({ job, assignee, onBack, onShipped, setError }) {
   ].join("\n");
 
   const copyReport = () => {
-    navigator.clipboard.writeText(`${job.address}\n\n${reportText}`);
+    navigator.clipboard.writeText(reportText);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1800);
   };
 
   const ship = async () => {
@@ -491,7 +511,7 @@ function ReportScreen({ job, assignee, onBack, onShipped, setError }) {
     setError(null);
     try {
       await withRetry(() => backendPost("shipReport", { slug: job.slug, assignee }));
-      await onShipped();
+      onShipped();
     } catch (e) { setError("Couldn't mark report as sent (" + e.message + ")."); }
     finally { setShipping(false); }
   };
@@ -500,7 +520,7 @@ function ReportScreen({ job, assignee, onBack, onShipped, setError }) {
     <div>
       <div style={S.ph}>
         <button style={S.gBtn} onClick={onBack}><ArrowLeft size={12} /> BACK</button>
-        <button style={S.gBtn} onClick={copyReport}>COPY</button>
+        <button style={S.gBtn} onClick={copyReport}>{copied ? "✓ COPIED" : "COPY"}</button>
       </div>
       <div style={S.dAddr}>{assignee}</div>
       <div style={S.metaTxt}>{job.address}{deadline ? ` · Due ${fmtDate(deadline)}` : ""}</div>
