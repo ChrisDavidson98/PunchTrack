@@ -44,12 +44,50 @@ const ITEMS_SHEET = 'Items';
 const JOBS_HEADERS = ['slug', 'address', 'closingDate', 'createdAt', 'lastUpdated'];
 const ITEMS_HEADERS = ['id', 'slug', 'room', 'item', 'assignee', 'status', 'dateLogged', 'dateSent', 'notes', 'dateCompleted'];
 
+// ── Rate limiting ────────────────────────────────────────────────
+// Same pattern as the Scope Deviation backend (BuildTrackUnified repo): CacheService
+// buckets reset every RATE_LIMIT_WINDOW_SEC seconds. Reads are cheap and generous;
+// writes are tighter since they mutate data; AI calls are strictest since each one
+// costs real Anthropic API spend. There's also a separate PER-DAY ceiling on AI
+// calls (stored in Script Properties, since CacheService can't hold a counter for
+// a full day) so a leaked token left running overnight can't run up a large bill.
+// Apps Script web apps don't expose caller IP/Origin, so these limits are global
+// (shared across all callers), not per-caller — fine for a one-or-two-person tool.
+
+const RATE_LIMIT_WINDOW_SEC = 60;
+const RATE_LIMIT_MAX_READS = 60;   // listJobs / getJob
+const RATE_LIMIT_MAX_WRITES = 20;  // createJob / saveJob / deleteJob / saveItems / shipReport / resolveFlag / updateItem / applyConfirmations
+const RATE_LIMIT_MAX_AI = 10;      // parseDictation / parseConfirmation, per minute
+const AI_DAILY_CAP = 150;          // parseDictation / parseConfirmation, per calendar day
+
+function checkRateLimit(bucket, max) {
+  const cache = CacheService.getScriptCache();
+  const key = 'rl_' + bucket;
+  const count = Number(cache.get(key) || 0);
+  if (count >= max) {
+    throw new Error('Rate limit exceeded — too many requests, try again in a minute.');
+  }
+  cache.put(key, String(count + 1), RATE_LIMIT_WINDOW_SEC);
+}
+
+function checkDailyAiCap() {
+  const props = PropertiesService.getScriptProperties();
+  const today = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  const key = 'ai_count_' + today;
+  const count = Number(props.getProperty(key) || 0);
+  if (count >= AI_DAILY_CAP) {
+    throw new Error('Daily AI request limit reached — resets tomorrow. If this wasn\'t you, rotate APP_TOKEN.');
+  }
+  props.setProperty(key, String(count + 1));
+}
+
 // ── Entry points ─────────────────────────────────────────────────
 
 function doGet(e) {
   try {
     const params = e.parameter;
     checkToken(params.token);
+    checkRateLimit('read', RATE_LIMIT_MAX_READS);
     const action = params.action;
 
     if (action === 'listJobs') return respond(listJobs());
@@ -67,16 +105,24 @@ function doPost(e) {
     checkToken(body.token);
     const action = body.action;
 
-    if (action === 'createJob') return respond(createJob(body.job));
-    if (action === 'saveJob') return respond(saveJob(body.job));
-    if (action === 'deleteJob') return respond(deleteJob(body.slug));
-    if (action === 'parseDictation') return respond(parseDictation(body.dictation));
-    if (action === 'saveItems') return respond(saveItems(body.slug, body.items));
-    if (action === 'shipReport') return respond(shipReport(body.slug, body.assignee));
-    if (action === 'resolveFlag') return respond(resolveFlag(body.itemId, body.resolution));
-    if (action === 'updateItem') return respond(updateItem(body.item));
-    if (action === 'parseConfirmation') return respond(parseConfirmation(body.dictation, body.openItems));
-    if (action === 'applyConfirmations') return respond(applyConfirmations(body.matches));
+    if (action === 'createJob') { checkRateLimit('write', RATE_LIMIT_MAX_WRITES); return respond(createJob(body.job)); }
+    if (action === 'saveJob') { checkRateLimit('write', RATE_LIMIT_MAX_WRITES); return respond(saveJob(body.job)); }
+    if (action === 'deleteJob') { checkRateLimit('write', RATE_LIMIT_MAX_WRITES); return respond(deleteJob(body.slug)); }
+    if (action === 'saveItems') { checkRateLimit('write', RATE_LIMIT_MAX_WRITES); return respond(saveItems(body.slug, body.items)); }
+    if (action === 'shipReport') { checkRateLimit('write', RATE_LIMIT_MAX_WRITES); return respond(shipReport(body.slug, body.assignee)); }
+    if (action === 'resolveFlag') { checkRateLimit('write', RATE_LIMIT_MAX_WRITES); return respond(resolveFlag(body.itemId, body.resolution)); }
+    if (action === 'updateItem') { checkRateLimit('write', RATE_LIMIT_MAX_WRITES); return respond(updateItem(body.item)); }
+    if (action === 'applyConfirmations') { checkRateLimit('write', RATE_LIMIT_MAX_WRITES); return respond(applyConfirmations(body.matches)); }
+    if (action === 'parseDictation') {
+      checkRateLimit('ai', RATE_LIMIT_MAX_AI);
+      checkDailyAiCap();
+      return respond(parseDictation(body.dictation));
+    }
+    if (action === 'parseConfirmation') {
+      checkRateLimit('ai', RATE_LIMIT_MAX_AI);
+      checkDailyAiCap();
+      return respond(parseConfirmation(body.dictation, body.openItems));
+    }
 
     return respond({ error: 'Unknown POST action: ' + action });
   } catch (err) {
