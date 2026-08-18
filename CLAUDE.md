@@ -38,5 +38,9 @@ Chris — Superintendent at Prieb Homes (high-volume residential new home builde
 - Bullets formatted as `Room: Item` (colon separator, sub-location in parens allowed, related fixes combined with semicolons).
 - Cleaners typically scheduled the day after the deadline (day before closing).
 
+## PunchTrack-specific notes
+- Review-item inputs (room/item/assignee) in the pending-review layout must each have `width: "100%"` or `flex: 1` set explicitly — a bare `S.tIn` style falls back to the browser's default input width (~20 chars) and leaves dead space instead of filling the row. Fixed once already for the item/description field ([index.html](index.html)) — check for the same gap if new fields are added to that layout.
+- `Code.gs` in this repo is a **copy**, not a live sync — Apps Script does not pull from GitHub automatically. After any Code.gs change is pushed here, it still has to be manually pasted into the Apps Script editor and redeployed (Deploy > new deployment / manage deployments) before it takes effect.
+
 ---
 *This is a shared/starter context file. Add tool-specific data models, status flows, and file structure notes for whichever repo this lives in.*
