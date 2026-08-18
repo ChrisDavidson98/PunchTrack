@@ -685,7 +685,7 @@ function ReviewPending({ items, closingDate, onUpdate, onRemove, onConfirm, onCa
               <input style={{ ...S.tIn, flex: 1 }} value={it.room} onChange={e => onUpdate(it.id, "room", e.target.value)} placeholder="Room" />
               <button style={S.iconBtn} onClick={() => onRemove(it.id)}><Trash2 size={13} /></button>
             </div>
-            <input style={{ ...S.tIn, marginBottom: 6 }} value={it.item} onChange={e => onUpdate(it.id, "item", e.target.value)} placeholder="Item" />
+            <input style={{ ...S.tIn, width: "100%", marginBottom: 6 }} value={it.item} onChange={e => onUpdate(it.id, "item", e.target.value)} placeholder="Item" />
             <div style={{ display: "flex", gap: 6 }}>
               <input style={{ ...S.tIn, flex: 1 }} value={it.assignee} onChange={e => onUpdate(it.id, "assignee", e.target.value)} placeholder="Assignee" />
               <select style={S.tIn} value={it.status} onChange={e => onUpdate(it.id, "status", e.target.value)}>
