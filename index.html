@@ -173,6 +173,16 @@ function App() {
     await loadJob(slug);
   };
 
+  // Deep-link support: ?job=<slug> in the URL (set by the Portfolio
+  // Dashboard) opens that house's walkthrough directly instead of starting
+  // on the job list. Purely additive — normal navigation here is
+  // unaffected when the parameter is absent.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const slug = params.get("job");
+    if (slug) openJob(slug);
+  }, []);
+
   const createJob = async (address, closingDate) => {
     const slug = slugify(address) + "-" + newId().slice(0, 4);
     const job = { slug, address: address.trim(), closingDate: closingDate || "", createdAt: new Date().toISOString(), lastUpdated: new Date().toISOString() };
