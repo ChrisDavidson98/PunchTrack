@@ -79,7 +79,7 @@ conflict.
 ## Domain reference (construction workflow — for accuracy across all tools)
 
 - **Stage sequence:** foundation (service pulled → hole dug → formed/poured →
-  backfill) → framing → flat work → roof → rough-in (framing + MEP: E-Mech/electrical,
+  backfill) → flat work → framing → roof → rough-in (framing + MEP: E-Mech/electrical,
   P-Mech/plumbing, M-Mech/HVAC, with a "Furdown" carpentry step between P-Mech and
   E-Mech) → RI Inspect → ReRI Inspect (more progressed than RI Inspect) → sheetrock →
   trim → paint → finish trades (tile, countertops, fireplace, mirrors, hardware) →
