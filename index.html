@@ -201,10 +201,10 @@ function App() {
     } catch (e) { setError("Couldn't delete job."); }
   };
 
-  const refreshActiveJob = async () => { if (activeSlug) await loadJob(activeSlug); };
-
   // Updates the active job's items in place, no network round-trip — used right
-  // after a write we already know succeeded, so the screen updates instantly.
+  // after a write we already know succeeded, so the screen updates instantly
+  // instead of tearing down JobScreen for a full getJob refetch (which resets
+  // scroll position and collapses any expanded sections).
   const markSentLocally = (assignee) => {
     setActiveJob(prev => {
       if (!prev) return prev;
@@ -217,6 +217,33 @@ function App() {
             : it
         ),
       };
+    });
+  };
+
+  // Same idea, generalized to a single item by id — used for complete/reopen/edit/
+  // resolve-flag so those don't trigger the full-screen "LOADING…" swap either.
+  const updateItemLocally = (id, patch) => {
+    setActiveJob(prev => {
+      if (!prev) return prev;
+      return { ...prev, items: prev.items.map(it => it.id === id ? { ...it, ...patch } : it) };
+    });
+  };
+
+  // Batch version of updateItemLocally, plus optional new items to append and a
+  // closing date to set — covers "SAVE ITEMS" (new dictation) and "APPLY" (confirm
+  // pass matches), both of which used to call onRefresh() and trigger the same
+  // full-screen reload.
+  const applyLocalChanges = ({ patches, newItems, closingDate } = {}) => {
+    setActiveJob(prev => {
+      if (!prev) return prev;
+      let items = prev.items;
+      if (patches && patches.length) {
+        const byId = {};
+        patches.forEach(p => { byId[p.id] = p; });
+        items = items.map(it => byId[it.id] ? { ...it, ...byId[it.id] } : it);
+      }
+      if (newItems && newItems.length) items = items.concat(newItems);
+      return { ...prev, items, closingDate: closingDate || prev.closingDate };
     });
   };
 
@@ -241,8 +268,9 @@ function App() {
             : <JobScreen
                 job={activeJob}
                 onBack={() => { setScreen("list"); setActiveJob(null); }}
-                onRefresh={refreshActiveJob}
                 onOpenReport={openReport}
+                onUpdateItemLocal={updateItemLocally}
+                onApplyLocal={applyLocalChanges}
                 setError={setError}
               />
         )}
@@ -306,7 +334,7 @@ function JobList({ jobs, loading, onOpen, onCreate, onDelete }) {
 }
 
 // ── Job screen: dictate, review, ship ─────────────────────────────
-function JobScreen({ job, onBack, onRefresh, onOpenReport, setError }) {
+function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal, setError }) {
   const [dictation, setDictation] = useState("");
   const [processing, setProcessing] = useState(false);
   const [pendingItems, setPendingItems] = useState(null); // null = not reviewing; array = reviewing
@@ -351,13 +379,15 @@ function JobScreen({ job, onBack, onRefresh, onOpenReport, setError }) {
     try {
       const merged = items.concat(pendingItems);
       await withRetry(() => backendPost("saveItems", { slug: job.slug, items: merged }));
+      let newClosingDate = null;
       if (pendingClosingDate && !job.closingDate) {
         await withRetry(() => backendPost("saveJob", { job: { ...job, closingDate: pendingClosingDate } }));
+        newClosingDate = pendingClosingDate;
       }
+      onApplyLocal({ newItems: pendingItems, closingDate: newClosingDate });
       setPendingItems(null);
       setPendingClosingDate(null);
       setDictation("");
-      await onRefresh();
     } catch (e) {
       setError("Couldn't save items (" + e.message + ").");
     } finally {
@@ -365,19 +395,25 @@ function JobScreen({ job, onBack, onRefresh, onOpenReport, setError }) {
     }
   };
 
+  // These four all patch a single item. Rather than a full getJob refetch (which
+  // swaps out this whole screen for a "LOADING…" placeholder and loses scroll
+  // position / expanded sections), apply the same patch locally once the write
+  // is confirmed — see onUpdateItemLocal in App.
   const resolveFlaggedItem = async (item, newAssignee) => {
     setError(null);
+    const patch = { assignee: newAssignee, status: "assignable" };
     try {
       await withRetry(() => backendPost("resolveFlag", { itemId: item.id, resolution: { newAssignee, newStatus: "assignable" } }));
-      await onRefresh();
+      onUpdateItemLocal(item.id, patch);
     } catch (e) { setError("Couldn't resolve item (" + e.message + ")."); }
   };
 
   const reopenItem = async (item) => {
     setError(null);
+    const patch = { status: "assignable", dateCompleted: "" };
     try {
-      await withRetry(() => backendPost("updateItem", { item: { id: item.id, status: "assignable", dateCompleted: "" } }));
-      await onRefresh();
+      await withRetry(() => backendPost("updateItem", { item: { id: item.id, ...patch } }));
+      onUpdateItemLocal(item.id, patch);
     } catch (e) { setError("Couldn't reopen item (" + e.message + ")."); }
   };
 
@@ -385,15 +421,16 @@ function JobScreen({ job, onBack, onRefresh, onOpenReport, setError }) {
     setError(null);
     try {
       await withRetry(() => backendPost("updateItem", { item }));
-      await onRefresh();
+      onUpdateItemLocal(item.id, item);
     } catch (e) { setError("Couldn't save edit (" + e.message + ")."); }
   };
 
   const markComplete = async (item) => {
     setError(null);
+    const patch = { status: "completed", dateCompleted: new Date().toISOString() };
     try {
-      await withRetry(() => backendPost("updateItem", { item: { id: item.id, status: "completed", dateCompleted: new Date().toISOString() } }));
-      await onRefresh();
+      await withRetry(() => backendPost("updateItem", { item: { id: item.id, ...patch } }));
+      onUpdateItemLocal(item.id, patch);
     } catch (e) { setError("Couldn't mark complete (" + e.message + ")."); }
   };
 
@@ -402,7 +439,7 @@ function JobScreen({ job, onBack, onRefresh, onOpenReport, setError }) {
     setConfirmProcessing(true);
     setError(null);
     try {
-      const openItemsForMatch = openItems.map(it => ({ id: it.id, room: it.room, item: it.item }));
+      const openItemsForMatch = openItems.map(it => ({ id: it.id, room: it.room, item: it.item, assignee: it.assignee }));
       const result = await withRetry(() => backendPost("parseConfirmation", { dictation: confirmDictation, openItems: openItemsForMatch }));
       setPendingConfirmations(result);
     } catch (e) {
@@ -424,9 +461,17 @@ function JobScreen({ job, onBack, onRefresh, onOpenReport, setError }) {
     setError(null);
     try {
       await withRetry(() => backendPost("applyConfirmations", { matches: pendingConfirmations.matches }));
+      const now = new Date().toISOString();
+      const patches = pendingConfirmations.matches.map(m => {
+        const existing = items.find(it => it.id === m.id);
+        const notes = m.note ? ((existing && existing.notes ? existing.notes + " | " : "") + m.note) : (existing ? existing.notes : "");
+        return m.action === "complete"
+          ? { id: m.id, status: "completed", dateCompleted: now, notes }
+          : { id: m.id, notes };
+      });
+      onApplyLocal({ patches });
       setPendingConfirmations(null);
       setConfirmDictation("");
-      await onRefresh();
     } catch (e) {
       setError("Couldn't apply confirmations (" + e.message + ").");
     } finally {

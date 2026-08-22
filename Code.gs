@@ -275,7 +275,7 @@ function updateItem(item) {
 function parseConfirmation(dictation, openItems) {
   const systemPrompt = `You help a superintendent log a revisit/confirmation pass against a punch list.
 
-You are given a list of currently-open items (each with an id, room, and item description) and a rambled voice-memo transcript where the superintendent describes what he found on a revisit — some items now done, some still pending with new context, some not mentioned at all (leave those alone).
+You are given a list of currently-open items (each with an id, room, item description, and assignee) and a rambled voice-memo transcript where the superintendent describes what he found on a revisit — some items now done, some still pending with new context, some not mentioned at all (leave those alone).
 
 OUTPUT: respond with ONLY a raw JSON object, no markdown fences, no preamble. Shape:
 {
@@ -287,6 +287,7 @@ OUTPUT: respond with ONLY a raw JSON object, no markdown fences, no preamble. Sh
 
 RULES:
 - Match by meaning, not exact wording — "grout in the kitchen is done" matches an open item like "Kitchen: Grout caulking touch up".
+- Bulk-by-assignee phrasing: if the superintendent says something like "all items for Rod are done" or "everything for the electrician is finished," match it against EVERY open item whose assignee is that trade/person — output one entry per matching item, each called out individually by its own id, not one combined entry.
 - action "complete": the superintendent clearly said this item is now finished/fixed/done.
 - action "note": the superintendent gave an update but the item is NOT yet done (still pending, waiting on something, partially done) — capture that update tersely in "note", do not mark complete.
 - Never invent a match. If you're not confident which open item a snippet refers to, put the raw snippet in "unmatched" instead of guessing.
