@@ -15,6 +15,12 @@ input, textarea, button, a { font-family: inherit; }
 input[type="date"]::-webkit-calendar-picker-indicator { filter: invert(0.6); cursor: pointer; }
 textarea { outline: none; }
 button { outline: none; }
+/* Instant press feedback. Deliberately uses transform + filter rather than
+   opacity: several buttons set opacity inline (the disabled/dimmed states), and
+   an inline style would win over this rule and swallow the feedback. No
+   transition — the whole point is that something happens the moment a finger
+   lands, before any network call returns. */
+button:active:not(:disabled) { transform: scale(0.97); filter: brightness(1.35); }
 ::-webkit-scrollbar { width: 4px; } ::-webkit-scrollbar-track { background: #08090a; } ::-webkit-scrollbar-thumb { background: #232a38; border-radius: 2px; }
 </style>
 </head>
@@ -96,6 +102,77 @@ function workingDaysBefore(dateStr, n) {
   return d.toISOString().slice(0, 10);
 }
 
+// ── House archive export ─────────────────────────────────────────
+// Builds the whole punch-list history for one house as plain markdown. Two
+// destinations for the same file: attached in CoConstruct as the permanent
+// record, and dropped in the house's Slack channel — where Claude can actually
+// read the text back out. That second use is why this is markdown and not a PDF:
+// the Slack connector only sees a PDF's metadata, so a PDF would have needed a
+// companion .md alongside it, and Chris only wants one file per export.
+//
+// Every item ever logged goes in, whatever its current status — this is an audit
+// trail, not an outstanding-work list.
+function buildArchiveMarkdown(job, now = new Date()) {
+  const items = job.items || [];
+
+  // Group by assignee in first-appearance order, which is sheet row order, which
+  // is the order things were dictated. Same grouping the job screen does, just
+  // over all statuses instead of only the open ones. Flagged items always carry
+  // an assignee ("Unassigned" at worst — the backend guarantees it), so nothing
+  // falls out of the grouping.
+  const order = [];
+  const byAssignee = {};
+  items.forEach(it => {
+    const who = it.assignee || "Unassigned";
+    if (!byAssignee[who]) { byAssignee[who] = []; order.push(who); }
+    byAssignee[who].push(it);
+  });
+
+  const lines = [
+    `# ${job.address}`,
+    `Walkthrough Items — generated ${fmtDate(now.toISOString())}`,
+  ];
+
+  order.forEach(who => {
+    lines.push("", `## ${who}`);
+    byAssignee[who].forEach(it => {
+      // "Room: Item" is the house convention everywhere in this tool — the
+      // sub-location parens and semicolon-joined related fixes are already baked
+      // into it.item as dictated, so there's nothing to re-format here.
+      const dates = [];
+      if (it.dateLogged) dates.push(`logged ${fmtDate(it.dateLogged)}`);
+      if (it.status === "completed" && it.dateCompleted) dates.push(`completed ${fmtDate(it.dateCompleted)}`);
+      lines.push(`- ${it.room}: ${it.item}${dates.length ? " — " + dates.join(", ") : ""}`);
+      // Notes accumulate from confirm-pass dictation ("still waiting on part"),
+      // and are often the only written record of why something dragged.
+      if (it.notes) lines.push(`  - ${it.notes}`);
+    });
+  });
+
+  return lines.join("\n") + "\n";
+}
+
+// Date + time in the filename, not just date — two exports of the same house on
+// the same day would otherwise land in Slack as two files with one name.
+function archiveFilename(job, now = new Date()) {
+  const p = n => String(n).padStart(2, "0");
+  const stamp = `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}-${p(now.getHours())}${p(now.getMinutes())}`;
+  return `${slugify(job.address)}-punchlist-${stamp}.md`;
+}
+
+function downloadTextFile(filename, text) {
+  const url = URL.createObjectURL(new Blob([text], { type: "text/markdown;charset=utf-8" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  // Revoking immediately can cancel the download on some mobile browsers before
+  // it's actually started, so give it a beat.
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
 async function withRetry(fn, attempts = 3, delayMs = 400) {
   let lastErr;
   for (let i = 0; i < attempts; i++) {
@@ -133,6 +210,7 @@ const Trash2 = p => <Icon {...p}><polyline points="3 6 5 6 21 6" /><path d="M19 
 const Send = p => <Icon {...p}><line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" /></Icon>;
 const AlertTriangle = p => <Icon {...p}><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" /><line x1="12" y1="9" x2="12" y2="13" /><line x1="12" y1="17" x2="12.01" y2="17" /></Icon>;
 const CheckCircle2 = p => <Icon {...p}><path d="M21.8 10A10 10 0 1 1 17 3.3" /><polyline points="22 4 12 14.01 9 11.01" /></Icon>;
+const Download = p => <Icon {...p}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></Icon>;
 
 // ── App shell ────────────────────────────────────────────────────
 function App() {
@@ -343,6 +421,7 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
   const [confirmProcessing, setConfirmProcessing] = useState(false);
   const [pendingConfirmations, setPendingConfirmations] = useState(null); // { matches, unmatched } while reviewing
   const [expandedAssignee, setExpandedAssignee] = useState(null);
+  const [exported, setExported] = useState(false); // brief "EXPORTED" confirmation on the button
 
   const items = job.items || [];
   const openItems = items.filter(it => it.status === "assignable" || it.status === "sent");
@@ -397,41 +476,65 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
 
   // These four all patch a single item. Rather than a full getJob refetch (which
   // swaps out this whole screen for a "LOADING…" placeholder and loses scroll
-  // position / expanded sections), apply the same patch locally once the write
-  // is confirmed — see onUpdateItemLocal in App.
-  const resolveFlaggedItem = async (item, newAssignee) => {
+  // position / expanded sections), apply the same patch locally — see
+  // onUpdateItemLocal in App.
+  //
+  // The patch is applied *before* the write, not after: waiting on the Apps
+  // Script round-trip meant nothing happened on screen for a beat, so a finger
+  // stayed down long enough for the tap to read as a long-press (text selection)
+  // rather than a press. Same optimistic pattern as markSentLocally. If the
+  // write ultimately fails, roll the changed fields back to what they were and
+  // show the error banner — a failed write must never leave a row sitting there
+  // looking completed.
+  const optimisticPatch = async (id, patch, write, errMsg) => {
     setError(null);
-    const patch = { assignee: newAssignee, status: "assignable" };
+    const before = items.find(it => it.id === id);
+    const rollback = {};
+    if (before) Object.keys(patch).forEach(k => { rollback[k] = before[k] === undefined ? "" : before[k]; });
+    onUpdateItemLocal(id, patch);
     try {
-      await withRetry(() => backendPost("resolveFlag", { itemId: item.id, resolution: { newAssignee, newStatus: "assignable" } }));
-      onUpdateItemLocal(item.id, patch);
-    } catch (e) { setError("Couldn't resolve item (" + e.message + ")."); }
+      await withRetry(write);
+    } catch (e) {
+      if (before) onUpdateItemLocal(id, rollback);
+      setError(errMsg + " (" + e.message + ").");
+    }
   };
 
-  const reopenItem = async (item) => {
-    setError(null);
-    const patch = { status: "assignable", dateCompleted: "" };
-    try {
-      await withRetry(() => backendPost("updateItem", { item: { id: item.id, ...patch } }));
-      onUpdateItemLocal(item.id, patch);
-    } catch (e) { setError("Couldn't reopen item (" + e.message + ")."); }
-  };
+  const resolveFlaggedItem = (item, newAssignee) =>
+    optimisticPatch(
+      item.id,
+      { assignee: newAssignee, status: "assignable" },
+      () => backendPost("resolveFlag", { itemId: item.id, resolution: { newAssignee, newStatus: "assignable" } }),
+      "Couldn't resolve item"
+    );
 
-  const saveItemEdit = async (item) => {
-    setError(null);
-    try {
-      await withRetry(() => backendPost("updateItem", { item }));
-      onUpdateItemLocal(item.id, item);
-    } catch (e) { setError("Couldn't save edit (" + e.message + ")."); }
-  };
+  const reopenItem = (item) =>
+    optimisticPatch(
+      item.id,
+      { status: "assignable", dateCompleted: "" },
+      () => backendPost("updateItem", { item: { id: item.id, status: "assignable", dateCompleted: "" } }),
+      "Couldn't reopen item"
+    );
 
-  const markComplete = async (item) => {
-    setError(null);
+  // `item` here is already the edited copy, so the patch is just the fields the
+  // edit form can change — optimisticPatch reads the pre-edit values back out of
+  // `items` for the rollback.
+  const saveItemEdit = (item) =>
+    optimisticPatch(
+      item.id,
+      { room: item.room, item: item.item, assignee: item.assignee },
+      () => backendPost("updateItem", { item }),
+      "Couldn't save edit"
+    );
+
+  const markComplete = (item) => {
     const patch = { status: "completed", dateCompleted: new Date().toISOString() };
-    try {
-      await withRetry(() => backendPost("updateItem", { item: { id: item.id, ...patch } }));
-      onUpdateItemLocal(item.id, patch);
-    } catch (e) { setError("Couldn't mark complete (" + e.message + ")."); }
+    return optimisticPatch(
+      item.id,
+      patch,
+      () => backendPost("updateItem", { item: { id: item.id, ...patch } }),
+      "Couldn't mark complete"
+    );
   };
 
   const processConfirmation = async () => {
@@ -479,10 +582,27 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
     }
   };
 
+  // Manual only — nothing triggers this off a status change. Downloads one .md
+  // covering every item ever logged here; see buildArchiveMarkdown.
+  const exportArchive = () => {
+    const now = new Date();
+    downloadTextFile(archiveFilename(job, now), buildArchiveMarkdown(job, now));
+    setExported(true);
+    setTimeout(() => setExported(false), 1800);
+  };
+
   return (
     <div>
       <div style={S.ph}>
         <button style={S.gBtn} onClick={onBack}><ArrowLeft size={12} /> BACK</button>
+        <button
+          style={{ ...S.gBtn, opacity: items.length ? 1 : 0.4 }}
+          onClick={exportArchive}
+          disabled={!items.length}
+          title="Download the full punch-list history for this house as a .md file"
+        >
+          <Download size={12} /> {exported ? "EXPORTED" : "EXPORT"}
+        </button>
       </div>
       <div style={S.dAddr}>{job.address}</div>
       {job.closingDate && <div style={S.metaTxt}>Closing {fmtDate(job.closingDate)}</div>}
@@ -843,9 +963,15 @@ const S = {
   ph: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20, gap: 8 },
   pt: { fontFamily: "'Barlow Condensed',sans-serif", fontSize: 26, fontWeight: 700, color: "#f3f4f6", letterSpacing: "0.05em", margin: 0 },
   dc: { fontSize: 16, color: "#4b5563", marginLeft: 8 },
-  pBtn: { backgroundColor: "#5c7a99", color: "#08090a", border: "none", padding: "9px 18px", borderRadius: 4, fontSize: 11, fontWeight: 700, letterSpacing: "0.12em", cursor: "pointer", fontFamily: "'DM Mono',monospace" },
-  gBtn: { background: "none", border: "1px solid #232a38", color: "#9ca3af", padding: "7px 14px", borderRadius: 4, fontSize: 11, letterSpacing: "0.1em", cursor: "pointer", fontFamily: "'DM Mono',monospace", display: "flex", alignItems: "center", gap: 4 },
-  iconBtn: { background: "none", border: "1px solid #232a38", color: "#6b7280", borderRadius: 4, width: 26, height: 26, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" },
+  // The userSelect / touchAction properties on the three button styles below are
+  // the touch lockdown: on a phone, a button that doesn't respond instantly gets
+  // held a beat too long and the browser reads it as a long-press, which selects
+  // the button's label text instead of firing the action. These tell the browser
+  // there's nothing selectable here and no double-tap-zoom to wait for, so a slow
+  // tap is still just a tap. Keep them on any new shared button style too.
+  pBtn: { backgroundColor: "#5c7a99", color: "#08090a", border: "none", padding: "9px 18px", borderRadius: 4, fontSize: 11, fontWeight: 700, letterSpacing: "0.12em", cursor: "pointer", fontFamily: "'DM Mono',monospace", userSelect: "none", WebkitUserSelect: "none", WebkitTouchCallout: "none", touchAction: "manipulation" },
+  gBtn: { background: "none", border: "1px solid #232a38", color: "#9ca3af", padding: "7px 14px", borderRadius: 4, fontSize: 11, letterSpacing: "0.1em", cursor: "pointer", fontFamily: "'DM Mono',monospace", display: "flex", alignItems: "center", gap: 4, userSelect: "none", WebkitUserSelect: "none", WebkitTouchCallout: "none", touchAction: "manipulation" },
+  iconBtn: { background: "none", border: "1px solid #232a38", color: "#6b7280", borderRadius: 4, width: 26, height: 26, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", userSelect: "none", WebkitUserSelect: "none", WebkitTouchCallout: "none", touchAction: "manipulation" },
   stack: { display: "flex", flexDirection: "column", gap: 8 },
   card: { backgroundColor: "#0f131b", border: "1px solid #1c2230", borderRadius: 8, padding: 14, cursor: "pointer" },
   cardRow: { display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 },

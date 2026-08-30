@@ -137,3 +137,13 @@ Review-item inputs (room/item/assignee) in the pending-review layout must each h
 `width: "100%"` or `flex: 1` set explicitly — a bare `S.tIn` style falls back to the
 browser's default input width (~20 chars) and leaves dead space instead of filling
 the row. Check for the same gap if new fields are added to that layout.
+
+Any new shared button style must carry `userSelect: "none"`, `WebkitUserSelect:
+"none"` and `touchAction: "manipulation"` (see `S.pBtn`/`S.gBtn`/`S.iconBtn`).
+Without them a tap held a fraction too long on a phone registers as a long-press
+and selects the button's label text instead of firing the action.
+
+Item writes (complete/reopen/edit/resolve-flag) go through `optimisticPatch` in
+JobScreen: patch local state *first*, then write, and roll the changed fields back
+on failure. Awaiting the Apps Script round-trip before updating the screen is what
+caused that long-press misfire in the first place — don't reintroduce it.
