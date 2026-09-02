@@ -4,6 +4,8 @@
  * Mirrors the Scope Deviation backend's pattern:
  *  - GET  requests => read actions   (listJobs, getJob)
  *  - POST requests => write/AI actions (createJob, saveJob, deleteJob, parseDictation)
+ *    saveJob merges into the existing row, so a partial job object ({ slug, closingDate }
+ *    or { slug, archived }) updates just those fields and leaves the rest alone.
  *  - CORS: POST bodies must stay text/plain (avoids preflight); response always JSON.
  *
  * SETUP
@@ -41,7 +43,16 @@ const CLAUDE_MODEL = 'claude-sonnet-4-5-20250929'; // update if you want a diffe
 const JOBS_SHEET = 'Jobs';
 const ITEMS_SHEET = 'Items';
 
-const JOBS_HEADERS = ['slug', 'address', 'closingDate', 'createdAt', 'lastUpdated'];
+// 'archived' is a display flag only — an archived house keeps every row it has
+// and is still returned by listJobs; the front end just files it under a
+// collapsed ARCHIVED section instead of the active list. Adding it here is what
+// lets the flag survive a saveJob: objectsToSheet writes these columns and only
+// these, so before this column existed an `archived` field sent by the client
+// was silently dropped. The front end mirrors the flag into localStorage as
+// well, so archiving still works on a browser talking to a copy of this file
+// that predates the column — it just stays on that one device until this
+// version is pasted into the Apps Script editor and redeployed.
+const JOBS_HEADERS = ['slug', 'address', 'closingDate', 'createdAt', 'lastUpdated', 'archived'];
 const ITEMS_HEADERS = ['id', 'slug', 'room', 'item', 'assignee', 'status', 'dateLogged', 'dateSent', 'notes', 'dateCompleted'];
 
 // ── Rate limiting ────────────────────────────────────────────────

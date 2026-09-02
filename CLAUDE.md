@@ -114,7 +114,21 @@ conflict.
 Voice-dictated walkthrough punch items. Dictate → parse → review → ship.
 
 ### Data model
-`Jobs` sheet: slug | address | closingDate | createdAt | lastUpdated.
+`Jobs` sheet: slug | address | closingDate | createdAt | lastUpdated | archived.
+`closingDate` is editable after the fact (amendments push closings back) — the job
+screen writes it through `saveJob` with a partial `{ slug, closingDate }` payload.
+`archived` hides a house from the active list and nothing else: all rows stay, and
+it's still openable, exportable and restorable. `deleteJob` remains the only thing
+that destroys data.
+
+Archiving degrades gracefully across the manual-redeploy gap. A browser talking to
+a `Code.gs` copy that predates the `archived` column parks the flag in
+`localStorage` (`punchtrack.archived`); the unknown field is dropped server-side
+rather than erroring. Presence of the `archived` key on a returned job is the
+feature-detect — the sheet is authoritative the moment it has the column, and
+`syncArchive()` pushes any parked flags up on the next load and clears the mirror.
+Don't make `localStorage` a co-equal source of truth; a stale local entry would
+re-archive a house restored on another device.
 `Items` sheet: id | slug | room | item | assignee | status | dateLogged | dateSent |
 notes | dateCompleted. `status` ∈ assignable | flagged | self_assigned | sent.
 An assignable item becomes "sent" when its report ships; flagged/self_assigned

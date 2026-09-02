@@ -72,6 +72,69 @@ function slugify(address) {
 }
 function newId() { return Math.random().toString(36).slice(2, 10); }
 
+// ── Archive state ────────────────────────────────────────────────
+// Archiving a house hides it from the active list and changes nothing else:
+// every item, note and date stays exactly where it was, and it can be opened,
+// exported or restored at any time. It is not a soft delete — DELETE is still
+// the only thing that removes data.
+//
+// The flag is stored in two places on purpose. It's written to the Jobs sheet
+// through saveJob so the archive follows the house to every device, AND
+// mirrored into this browser's localStorage so archiving still works against a
+// backend that doesn't know about the `archived` column yet — Code.gs is a
+// manual copy that has to be pasted into the Apps Script editor and redeployed
+// by hand (see CLAUDE.md), so the two can be out of sync for a while. An older
+// backend silently drops the unknown field instead of erroring, and the local
+// mirror covers the gap until the redeploy happens. A house counts as archived
+// if *either* source says so, so nothing un-archives itself in the meantime.
+const ARCHIVE_KEY = "punchtrack.archived";
+
+function localArchived() {
+  try { return new Set(JSON.parse(localStorage.getItem(ARCHIVE_KEY) || "[]")); }
+  catch (e) { return new Set(); } // private mode / storage disabled — sheet flag still works
+}
+function setLocalArchived(slug, archived) {
+  const set = localArchived();
+  if (archived) set.add(slug); else set.delete(slug);
+  try { localStorage.setItem(ARCHIVE_KEY, JSON.stringify(Array.from(set))); } catch (e) {}
+}
+// Sheets hands booleans back as real booleans, but a cell that was ever text
+// comes back as the string "TRUE"/"true" — accept both.
+function isArchivedFlag(job) {
+  return job.archived === true || String(job.archived).toLowerCase() === "true";
+}
+
+// The sheet wins whenever it has an opinion. sheetToObjects builds each job from
+// the sheet's own header row, so the `archived` key is present on every job the
+// moment the column exists and absent entirely before that — which makes its
+// presence the feature-detect. Falling back to the local mirror only when the key
+// is missing matters: otherwise a leftover local entry on one device would keep
+// re-archiving a house that was restored on another.
+function isArchived(job, localSet) {
+  if ("archived" in job) return isArchivedFlag(job);
+  return localSet.has(job.slug);
+}
+
+// Houses archived against a backend that predated the column are parked in
+// localStorage. As soon as the column shows up, push them into the sheet and
+// stop shadowing them here, so the archive becomes cross-device on its own
+// rather than needing to be redone house by house after the redeploy. A push
+// that fails just stays parked and is retried on the next load.
+async function syncArchive(jobs) {
+  const local = localArchived();
+  if (!local.size || !jobs.length || !("archived" in jobs[0])) return jobs;
+  const parked = jobs.filter(j => local.has(j.slug));
+  await Promise.all(parked.map(async j => {
+    if (isArchivedFlag(j)) { setLocalArchived(j.slug, false); return; } // already up there
+    try {
+      await withRetry(() => backendPost("saveJob", { job: { slug: j.slug, archived: true } }));
+      j.archived = true;
+      setLocalArchived(j.slug, false);
+    } catch (e) { /* leave it parked — the local flag still hides it here */ }
+  }));
+  return jobs;
+}
+
 // Google Sheets sometimes silently converts a plain "YYYY-MM-DD" string into
 // its own Date type, which then comes back from the backend as a full
 // timestamp like "2026-08-20T00:00:00.000Z" instead of a plain date string.
@@ -211,6 +274,8 @@ const Send = p => <Icon {...p}><line x1="22" y1="2" x2="11" y2="13" /><polygon p
 const AlertTriangle = p => <Icon {...p}><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z" /><line x1="12" y1="9" x2="12" y2="13" /><line x1="12" y1="17" x2="12.01" y2="17" /></Icon>;
 const CheckCircle2 = p => <Icon {...p}><path d="M21.8 10A10 10 0 1 1 17 3.3" /><polyline points="22 4 12 14.01 9 11.01" /></Icon>;
 const Download = p => <Icon {...p}><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></Icon>;
+const Archive = p => <Icon {...p}><rect x="2" y="4" width="20" height="5" rx="1" /><path d="M4 9v10a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1V9" /><line x1="10" y1="14" x2="14" y2="14" /></Icon>;
+const RotateCcw = p => <Icon {...p}><polyline points="1 4 1 10 7 10" /><path d="M3.5 15a9 9 0 1 0 2.1-9.4L1 10" /></Icon>;
 
 // ── App shell ────────────────────────────────────────────────────
 function App() {
@@ -222,13 +287,15 @@ function App() {
   const [jobLoading, setJobLoading] = useState(false);
   const [error, setError] = useState(null);
   const [reportAssignee, setReportAssignee] = useState(null);
+  const [archivedLocal, setArchivedLocal] = useState(() => localArchived());
 
   useEffect(() => {
     (async () => {
       if (!configured()) { setLoadingJobs(false); return; }
       try {
         const result = await withRetry(() => backendGet({ action: "listJobs" }));
-        setJobs(result || []);
+        setJobs(await syncArchive(result || []));
+        setArchivedLocal(localArchived());
       } catch (e) { setJobs([]); }
       finally { setLoadingJobs(false); }
     })();
@@ -277,6 +344,52 @@ function App() {
       await withRetry(() => backendPost("deleteJob", { slug }));
       setJobs(jobs.filter(j => j.slug !== slug));
     } catch (e) { setError("Couldn't delete job."); }
+  };
+
+  // Patches a job's own fields (not its items) in both places they're held: the
+  // list array and, if it's the one that's open, the loaded job. Same optimistic
+  // idea as updateItemLocally below — the screen changes first, the write follows.
+  const updateJobLocally = (slug, patch) => {
+    setJobs(prev => prev.map(j => (j.slug === slug ? { ...j, ...patch } : j)));
+    setActiveJob(prev => (prev && prev.slug === slug ? { ...prev, ...patch } : prev));
+  };
+
+  const jobField = (slug, field) => {
+    if (activeJob && activeJob.slug === slug) return activeJob[field];
+    const j = jobs.find(x => x.slug === slug);
+    return j ? j[field] : undefined;
+  };
+
+  // Closing dates move — an amendment pushes a closing back a week and every
+  // date derived from it (trade deadline, cleaners) has to follow. saveJob
+  // merges into the existing row, so only the fields that changed get sent.
+  const setClosingDate = async (slug, closingDate) => {
+    setError(null);
+    const rollback = jobField(slug, "closingDate") || "";
+    if (closingDate === rollback) return;
+    updateJobLocally(slug, { closingDate });
+    try {
+      await withRetry(() => backendPost("saveJob", { job: { slug, closingDate } }));
+    } catch (e) {
+      updateJobLocally(slug, { closingDate: rollback });
+      setError("Couldn't update the closing date (" + e.message + ").");
+    }
+  };
+
+  const toggleArchive = async (slug, archived, e) => {
+    if (e) e.stopPropagation();
+    setError(null);
+    updateJobLocally(slug, { archived });
+    setLocalArchived(slug, archived);
+    setArchivedLocal(localArchived());
+    try {
+      await withRetry(() => backendPost("saveJob", { job: { slug, archived } }));
+    } catch (err) {
+      updateJobLocally(slug, { archived: !archived });
+      setLocalArchived(slug, !archived);
+      setArchivedLocal(localArchived());
+      setError("Couldn't " + (archived ? "archive" : "restore") + " this house (" + err.message + ").");
+    }
   };
 
   // Updates the active job's items in place, no network round-trip — used right
@@ -338,7 +451,7 @@ function App() {
         {error && <div style={S.errBanner}>{error}</div>}
 
         {screen === "list" && (
-          <JobList jobs={jobs} loading={loadingJobs} onOpen={openJob} onCreate={createJob} onDelete={deleteJob} />
+          <JobList jobs={jobs} loading={loadingJobs} archivedLocal={archivedLocal} onOpen={openJob} onCreate={createJob} onDelete={deleteJob} onToggleArchive={toggleArchive} />
         )}
         {screen === "job" && (
           jobLoading || !activeJob
@@ -349,6 +462,7 @@ function App() {
                 onOpenReport={openReport}
                 onUpdateItemLocal={updateItemLocally}
                 onApplyLocal={applyLocalChanges}
+                onSetClosingDate={setClosingDate}
                 setError={setError}
               />
         )}
@@ -361,44 +475,84 @@ function App() {
 }
 
 // ── Job list ─────────────────────────────────────────────────────
-function JobList({ jobs, loading, onOpen, onCreate, onDelete }) {
+function JobCard({ job, archived, onOpen, onDelete, onToggleArchive }) {
+  return (
+    <div style={archived ? { ...S.card, opacity: 0.5 } : S.card} onClick={() => onOpen(job.slug)}>
+      <div style={S.cardRow}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={S.addr}>{job.address}</div>
+          {job.closingDate && <div style={S.metaTxt}>Closing {fmtDate(job.closingDate)}</div>}
+        </div>
+        <button
+          style={S.iconBtn}
+          title={archived ? "Restore to the active list" : "Archive — keeps everything, just hides it from the active list"}
+          onClick={(e) => onToggleArchive(job.slug, !archived, e)}
+        >
+          {archived ? <RotateCcw size={13} /> : <Archive size={13} />}
+        </button>
+        <button style={S.iconBtn} title="Delete permanently" onClick={(e) => onDelete(job.slug, e)}><Trash2 size={14} /></button>
+      </div>
+    </div>
+  );
+}
+
+function JobList({ jobs, loading, archivedLocal, onOpen, onCreate, onDelete, onToggleArchive }) {
   const [showAdd, setShowAdd] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
   const [addr, setAddr] = useState("");
   const [closing, setClosing] = useState("");
+
+  const active = jobs.filter(j => !isArchived(j, archivedLocal));
+  const archived = jobs.filter(j => isArchived(j, archivedLocal));
 
   const go = () => { if (addr.trim()) { onCreate(addr, closing); setAddr(""); setClosing(""); setShowAdd(false); } };
 
   return (
     <div>
       <div style={S.ph}>
-        <h1 style={S.pt}>Walkthrough Tracker <span style={S.dc}>{jobs.length}</span></h1>
+        <h1 style={S.pt}>Walkthrough Tracker <span style={S.dc}>{active.length}</span></h1>
         <button style={S.pBtn} onClick={() => setShowAdd(true)}>+ NEW HOUSE</button>
       </div>
       {loading && <div style={S.loading}>LOADING…</div>}
       {!loading && jobs.length === 0 && <Empty icon="🚶" text="No houses yet. Tap + NEW HOUSE to start a walkthrough." />}
+      {!loading && jobs.length > 0 && active.length === 0 && (
+        <Empty icon="✅" text="Nothing active — every house is archived." />
+      )}
       <div style={S.stack}>
-        {jobs.map(j => (
-          <div key={j.slug} style={S.card} onClick={() => onOpen(j.slug)}>
-            <div style={S.cardRow}>
-              <div style={{ flex: 1 }}>
-                <div style={S.addr}>{j.address}</div>
-                {j.closingDate && <div style={S.metaTxt}>Closing {fmtDate(j.closingDate)}</div>}
-              </div>
-              <button style={S.iconBtn} onClick={(e) => onDelete(j.slug, e)}><Trash2 size={14} /></button>
-            </div>
-          </div>
+        {active.map(j => (
+          <JobCard key={j.slug} job={j} archived={false} onOpen={onOpen} onDelete={onDelete} onToggleArchive={onToggleArchive} />
         ))}
       </div>
+
+      {archived.length > 0 && (
+        <>
+          <div style={S.div} />
+          <button
+            style={{ ...S.gBtn, width: "100%", justifyContent: "center" }}
+            onClick={() => setShowArchived(v => !v)}
+          >
+            {showArchived ? "▾" : "▸"} ARCHIVED ({archived.length})
+          </button>
+          {showArchived && (
+            <div style={{ ...S.stack, marginTop: 8 }}>
+              {archived.map(j => (
+                <JobCard key={j.slug} job={j} archived={true} onOpen={onOpen} onDelete={onDelete} onToggleArchive={onToggleArchive} />
+              ))}
+            </div>
+          )}
+        </>
+      )}
+
       {showAdd && (
         <Overlay title="New House">
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
             <div>
               <label style={S.fLbl}>ADDRESS</label>
-              <input style={S.tIn} placeholder="Street address…" value={addr} onChange={e => setAddr(e.target.value)} autoFocus />
+              <input style={{ ...S.tIn, width: "100%" }} placeholder="Street address…" value={addr} onChange={e => setAddr(e.target.value)} autoFocus />
             </div>
             <div>
-              <label style={S.fLbl}>CLOSING DATE (optional — can also be dictated)</label>
-              <input type="date" style={S.tIn} value={closing} onChange={e => setClosing(e.target.value)} />
+              <label style={S.fLbl}>CLOSING DATE (optional — can also be dictated, and changed later)</label>
+              <input type="date" style={{ ...S.tIn, width: "100%" }} value={closing} onChange={e => setClosing(e.target.value)} />
             </div>
           </div>
           <div style={{ ...S.mBtns, marginTop: 20 }}>
@@ -412,7 +566,7 @@ function JobList({ jobs, loading, onOpen, onCreate, onDelete }) {
 }
 
 // ── Job screen: dictate, review, ship ─────────────────────────────
-function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal, setError }) {
+function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal, onSetClosingDate, setError }) {
   const [dictation, setDictation] = useState("");
   const [processing, setProcessing] = useState(false);
   const [pendingItems, setPendingItems] = useState(null); // null = not reviewing; array = reviewing
@@ -422,6 +576,8 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
   const [pendingConfirmations, setPendingConfirmations] = useState(null); // { matches, unmatched } while reviewing
   const [expandedAssignee, setExpandedAssignee] = useState(null);
   const [exported, setExported] = useState(false); // brief "EXPORTED" confirmation on the button
+  const [editingClosing, setEditingClosing] = useState(false);
+  const [closingDraft, setClosingDraft] = useState("");
 
   const items = job.items || [];
   const openItems = items.filter(it => it.status === "assignable" || it.status === "sent");
@@ -582,6 +738,19 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
     }
   };
 
+  // The closing date isn't fixed once it's set — an amendment can push a closing
+  // back after the punch list has already been started. Slice to 10 chars because
+  // Sheets may hand the date back as a full timestamp and <input type="date">
+  // only accepts a bare YYYY-MM-DD (see parseLocalDate).
+  const openClosingEdit = () => {
+    setClosingDraft(job.closingDate ? String(job.closingDate).slice(0, 10) : "");
+    setEditingClosing(true);
+  };
+  const saveClosingEdit = () => {
+    setEditingClosing(false);
+    onSetClosingDate(job.slug, closingDraft);
+  };
+
   // Manual only — nothing triggers this off a status change. Downloads one .md
   // covering every item ever logged here; see buildArchiveMarkdown.
   const exportArchive = () => {
@@ -605,7 +774,14 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
         </button>
       </div>
       <div style={S.dAddr}>{job.address}</div>
-      {job.closingDate && <div style={S.metaTxt}>Closing {fmtDate(job.closingDate)}</div>}
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 4 }}>
+        <div style={{ ...S.metaTxt, marginTop: 0 }}>
+          {job.closingDate ? "Closing " + fmtDate(job.closingDate) : "No closing date set"}
+        </div>
+        <button style={{ ...S.gBtn, padding: "2px 8px", fontSize: 9 }} onClick={openClosingEdit}>
+          {job.closingDate ? "CHANGE" : "SET"}
+        </button>
+      </div>
 
       <div style={S.div} />
 
@@ -714,6 +890,36 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
           onCancel={() => { setPendingItems(null); setPendingClosingDate(null); }}
           processing={processing}
         />
+      )}
+
+      {editingClosing && (
+        <Overlay title="Closing Date">
+          <div>
+            <label style={S.fLbl}>CLOSING DATE</label>
+            <input
+              type="date"
+              style={{ ...S.tIn, width: "100%" }}
+              value={closingDraft}
+              onChange={e => setClosingDraft(e.target.value)}
+              autoFocus
+            />
+            <div style={{ ...S.metaTxt, marginTop: 10, lineHeight: 1.6 }}>
+              Trade reports read “prior to” two working days before this date, so
+              changing it moves every deadline that hasn't shipped yet. Anything
+              already sent went out with the old date — re-send those.
+            </div>
+          </div>
+          <div style={{ ...S.mBtns, marginTop: 20 }}>
+            <button style={S.gBtn} onClick={() => setEditingClosing(false)}>CANCEL</button>
+            <button
+              style={{ ...S.pBtn, opacity: closingDraft ? 1 : 0.4 }}
+              onClick={saveClosingEdit}
+              disabled={!closingDraft}
+            >
+              SAVE
+            </button>
+          </div>
+        </Overlay>
       )}
     </div>
   );
