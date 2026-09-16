@@ -114,19 +114,50 @@ conflict.
 Voice-dictated walkthrough punch items. Dictate → parse → review → ship.
 
 ### Data model
-`Jobs` sheet: slug | address | closingDate | createdAt | lastUpdated.
+`Jobs` sheet: slug | address | closingDate | createdAt | lastUpdated | archived.
 `Items` sheet: id | slug | room | item | assignee | status | dateLogged | dateSent |
-notes | dateCompleted. `status` ∈ assignable | flagged | self_assigned | sent.
-An assignable item becomes "sent" when its report ships; flagged/self_assigned
-items never auto-transition — self_assigned items get marked sent when Chris
-ships/acknowledges his own list, flagged items only leave "flagged" when manually
-resolved in the UI.
+notes | dateCompleted. `status` ∈ assignable | flagged | self_assigned | sent |
+completed. An assignable item becomes "sent" when its report ships; flagged/
+self_assigned items never auto-transition — self_assigned items get marked sent when
+Chris ships/acknowledges his own list, flagged items only leave "flagged" when
+manually resolved in the UI.
+
+`archived` is "" while a house is active and an ISO timestamp once archived.
+Archiving is not deleting: the house drops off the active list and out of helper
+lists, every row stays. `deleteJob` still hard-deletes and is a separate thing.
+
+### Priority model — one rule, applied everywhere
+Soonest closing date = highest priority. `listJobs` and `listPriebItems` both sort by
+it, so the job list and every generated helper list agree without anyone maintaining
+an order by hand. Houses with no closing date sort to the bottom, not the top.
+Within a house, order is sheet row order — which is dictation order, which is walk
+order. Don't re-sort it.
+
+### The Prieb lane
+Items assigned to **Prieb** are in-house work for Chris's helper. No email, no
+report, no "mark as sent" — they run open → completed. The lane is selected by the
+**assignee name**, not a dedicated status, so reassigning between a trade and Prieb
+is a single field edit and the item moves lanes on its own. `isPrieb()` exists in
+both `Code.gs` and `index.html` with matching alias lists — keep them in sync.
+Distinct from `Chris`/self_assigned, which is strictly Chris's own follow-up.
+
+`listPriebItems` returns open in-house items across all active houses in one call.
+That's deliberate: the alternative is one `getJob` per house, which trips this
+backend's own 60-reads-per-minute limit on a single screen load.
+
+The helper list is a filter and a sort, not a question — **no API call, no cost.**
+Don't "upgrade" it to an AI ask bar without being asked.
 
 ### Security status — has auth and rate limiting
 - `checkToken()` is enforced on every GET/POST action.
 - `CacheService` rate limiting (~60/min reads, ~20/min writes, ~10/min AI) plus a
-  per-day AI cap (150/day, Script Properties) on `parseDictation`/`parseConfirmation` —
+  per-day AI cap (150/day, Script Properties) on `parseDictation` —
   ported 2026-08-18 from BuildTrackUnified's Scope Deviation backend, same pattern.
+- Every write action runs inside `withLock()` (`LockService`), and single-item edits
+  go through `patchRows()`, which rewrites only the rows that changed. The old
+  clear-the-whole-sheet-and-rewrite approach is gone from the item write paths —
+  don't reintroduce it. `objectsToSheet` remains only for genuine bulk rewrites
+  (`deleteJob`, `saveJob`).
 - `Code.gs` in this repo is a manual **copy**, not a live sync — Apps Script doesn't
   pull from GitHub automatically. After any change here, it still has to be pasted
   into the Apps Script editor and redeployed (Deploy > new deployment / manage
@@ -147,3 +178,11 @@ Item writes (complete/reopen/edit/resolve-flag) go through `optimisticPatch` in
 JobScreen: patch local state *first*, then write, and roll the changed fields back
 on failure. Awaiting the Apps Script round-trip before updating the screen is what
 caused that long-press misfire in the first place — don't reintroduce it.
+
+### Removed on purpose (2026-09-16) — don't rebuild these
+- **Confirm Pass / follow-up dictation** (`parseConfirmation`, `applyConfirmations`,
+  `ReviewConfirmations`). Front-end dictation plus inline editing replaced it.
+  `notes` is now written by the manual edit form instead — it's the follow-up
+  history, and it's what the `.md` archive carries.
+- **`saveItems`**, which replaced every row for a job on each save. Replaced by
+  `addItems`, which appends only the new rows.

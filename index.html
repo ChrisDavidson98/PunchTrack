@@ -72,6 +72,36 @@ function slugify(address) {
 }
 function newId() { return Math.random().toString(36).slice(2, 10); }
 
+// ── The Prieb lane ───────────────────────────────────────────────
+// Mirrors isPrieb in Code.gs — in-house work for the helper, which never routes
+// through the trade flow (no report, no email, no "mark as sent"). The lane is
+// chosen by assignee name, so changing the assignee moves an item between lanes
+// with nothing else to update. Keep this list in sync with the backend's.
+const PRIEB_ALIASES = ["prieb", "prieb homes", "preib", "in-house", "in house", "inhouse"];
+function isPrieb(assignee) {
+  return PRIEB_ALIASES.indexOf(String(assignee || "").trim().toLowerCase()) !== -1;
+}
+
+// How far out a closing is, in whole days. Negative means it already passed.
+function daysUntil(dateStr) {
+  const d = parseLocalDate(dateStr);
+  if (!d) return null;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  return Math.round((d - today) / 86400000);
+}
+
+// Short, glanceable urgency for the job list — the whole priority model is
+// "soonest closing first," so the list has to actually show that.
+function closingLabel(dateStr) {
+  const n = daysUntil(dateStr);
+  if (n === null) return "No closing date";
+  if (n < 0) return `Closed ${fmtDate(dateStr)}`;
+  if (n === 0) return "Closes TODAY";
+  if (n === 1) return "Closes TOMORROW";
+  return `Closes ${fmtDate(dateStr)} · ${n} days`;
+}
+
 // Google Sheets sometimes silently converts a plain "YYYY-MM-DD" string into
 // its own Date type, which then comes back from the backend as a full
 // timestamp like "2026-08-20T00:00:00.000Z" instead of a plain date string.
@@ -128,9 +158,12 @@ function buildArchiveMarkdown(job, now = new Date()) {
     byAssignee[who].push(it);
   });
 
+  const done = items.filter(it => it.status === "completed").length;
   const lines = [
     `# ${job.address}`,
     `Walkthrough Items — generated ${fmtDate(now.toISOString())}`,
+    job.closingDate ? `Closing ${fmtDate(job.closingDate)}` : "Closing date not set",
+    `${items.length} items logged — ${done} done, ${items.length - done} still open`,
   ];
 
   order.forEach(who => {
@@ -139,17 +172,56 @@ function buildArchiveMarkdown(job, now = new Date()) {
       // "Room: Item" is the house convention everywhere in this tool — the
       // sub-location parens and semicolon-joined related fixes are already baked
       // into it.item as dictated, so there's nothing to re-format here.
+      //
+      // Status is spelled out rather than left as a raw code, and every date the
+      // row carries goes in. This file is read back months later — in Slack, often
+      // by Claude answering "what happened at this house" — so "sent Aug 21,
+      // completed Aug 25" is the entire value of the archive. A bare item line
+      // can't answer whether a trade ever got told.
       const dates = [];
       if (it.dateLogged) dates.push(`logged ${fmtDate(it.dateLogged)}`);
-      if (it.status === "completed" && it.dateCompleted) dates.push(`completed ${fmtDate(it.dateCompleted)}`);
-      lines.push(`- ${it.room}: ${it.item}${dates.length ? " — " + dates.join(", ") : ""}`);
-      // Notes accumulate from confirm-pass dictation ("still waiting on part"),
-      // and are often the only written record of why something dragged.
+      if (it.dateSent) dates.push(`sent ${fmtDate(it.dateSent)}`);
+      if (it.dateCompleted) dates.push(`completed ${fmtDate(it.dateCompleted)}`);
+      const label = STATUS_LABEL[it.status] || it.status || "open";
+      lines.push(`- ${it.room}: ${it.item} [${label}]${dates.length ? " — " + dates.join(", ") : ""}`);
+      // Notes are the follow-up history — "still waiting on the part," "second
+      // trip, still not right." Often the only written record of why something
+      // dragged, so they ride along under their item.
       if (it.notes) lines.push(`  - ${it.notes}`);
     });
   });
 
   return lines.join("\n") + "\n";
+}
+
+// Plain-English status for the archive file. The raw values are fine in a database
+// column and useless in a document someone reads a year later.
+const STATUS_LABEL = {
+  assignable: "open, not yet sent",
+  sent: "sent to trade, not confirmed done",
+  self_assigned: "open — Chris",
+  flagged: "flagged, needs a decision",
+  completed: "done",
+};
+
+// ── Helper list ──────────────────────────────────────────────────
+// Builds the text that gets pasted straight into a message to the helper.
+//
+// Deliberately plain: no assignee, no status, no dates, no "assigned to you"
+// language — he works a list of tasks in order, and every extra word is something
+// to misread. Room: Item, grouped by house, in the order they were dictated (which
+// is walk order, since the walk is what produced them).
+//
+// Nothing here calls the API. "Everything open at this address" is a filter and a
+// sort, not a question that needs interpreting, so this costs nothing to run and
+// works as fast as the phone can render it.
+function buildHelperList(houses) {
+  const blocks = houses.map(h => {
+    const lines = [h.address];
+    h.items.forEach(it => lines.push(`• ${it.room}: ${it.item}`));
+    return lines.join("\n");
+  });
+  return blocks.join("\n\n");
 }
 
 // Date + time in the filename, not just date — two exports of the same house on
@@ -261,7 +333,19 @@ function App() {
     if (slug) openJob(slug);
   }, []);
 
+  // Guard against the same house being created twice. Two jobs at one address
+  // would split its items across two records, and walking in and opening the wrong
+  // one would show half a punch list with no sign the other half exists — which is
+  // exactly the failure this tool is supposed to make impossible.
   const createJob = async (address, closingDate) => {
+    const existing = jobs.find(j => slugify(j.address) === slugify(address));
+    if (existing) {
+      const msg = existing.archived
+        ? `${existing.address} already exists but is archived. Open it anyway?`
+        : `${existing.address} already exists. Open the existing walkthrough instead of creating a second one?`;
+      if (window.confirm(msg)) await openJob(existing.slug);
+      return;
+    }
     const slug = slugify(address) + "-" + newId().slice(0, 4);
     const job = { slug, address: address.trim(), closingDate: closingDate || "", createdAt: new Date().toISOString(), lastUpdated: new Date().toISOString() };
     try { await withRetry(() => backendPost("createJob", { job })); }
@@ -277,6 +361,31 @@ function App() {
       await withRetry(() => backendPost("deleteJob", { slug }));
       setJobs(jobs.filter(j => j.slug !== slug));
     } catch (e) { setError("Couldn't delete job."); }
+  };
+
+  // Archiving is a two-step motion on purpose: download the .md first, and only
+  // flag the house once the file is actually in hand. The archive is the permanent
+  // record — it goes in the house's Slack channel and gets read back later — so
+  // there must be no way to file a house away and find out afterward that no
+  // record came with it. Nothing is deleted either way; the rows stay put.
+  const archiveJob = async (job) => {
+    if (!window.confirm(`Archive ${job.address}?\n\nThe .md record downloads first, then the house drops off the active list. Nothing is deleted.`)) return;
+    const now = new Date();
+    downloadTextFile(archiveFilename(job, now), buildArchiveMarkdown(job, now));
+    try {
+      const res = await withRetry(() => backendPost("archiveJob", { slug: job.slug, archived: true }));
+      setJobs(prev => prev.map(j => j.slug === job.slug ? { ...j, archived: res.archived || now.toISOString() } : j));
+      setScreen("list");
+      setActiveJob(null);
+    } catch (e) { setError("Downloaded the record, but couldn't archive the house (" + e.message + ")."); }
+  };
+
+  const unarchiveJob = async (slug, e) => {
+    e.stopPropagation();
+    try {
+      await withRetry(() => backendPost("archiveJob", { slug, archived: false }));
+      setJobs(prev => prev.map(j => j.slug === slug ? { ...j, archived: "" } : j));
+    } catch (e) { setError("Couldn't restore this house."); }
   };
 
   // Updates the active job's items in place, no network round-trip — used right
@@ -338,7 +447,18 @@ function App() {
         {error && <div style={S.errBanner}>{error}</div>}
 
         {screen === "list" && (
-          <JobList jobs={jobs} loading={loadingJobs} onOpen={openJob} onCreate={createJob} onDelete={deleteJob} />
+          <JobList
+            jobs={jobs}
+            loading={loadingJobs}
+            onOpen={openJob}
+            onCreate={createJob}
+            onDelete={deleteJob}
+            onUnarchive={unarchiveJob}
+            onHelperList={() => setScreen("helper")}
+          />
+        )}
+        {screen === "helper" && (
+          <HelperListScreen onBack={() => setScreen("list")} setError={setError} />
         )}
         {screen === "job" && (
           jobLoading || !activeJob
@@ -349,6 +469,7 @@ function App() {
                 onOpenReport={openReport}
                 onUpdateItemLocal={updateItemLocally}
                 onApplyLocal={applyLocalChanges}
+                onArchive={archiveJob}
                 setError={setError}
               />
         )}
@@ -361,34 +482,60 @@ function App() {
 }
 
 // ── Job list ─────────────────────────────────────────────────────
-function JobList({ jobs, loading, onOpen, onCreate, onDelete }) {
+function JobList({ jobs, loading, onOpen, onCreate, onDelete, onUnarchive, onHelperList }) {
   const [showAdd, setShowAdd] = useState(false);
   const [addr, setAddr] = useState("");
   const [closing, setClosing] = useState("");
+  const [showArchived, setShowArchived] = useState(false);
 
   const go = () => { if (addr.trim()) { onCreate(addr, closing); setAddr(""); setClosing(""); setShowAdd(false); } };
+
+  // The backend already returns these sorted by closing date, soonest first —
+  // the house closing next sits at the top of the screen, which is the entire
+  // priority model, applied in one place.
+  const active = jobs.filter(j => !j.archived);
+  const archived = jobs.filter(j => j.archived);
+  const shown = showArchived ? archived : active;
 
   return (
     <div>
       <div style={S.ph}>
-        <h1 style={S.pt}>Walkthrough Tracker <span style={S.dc}>{jobs.length}</span></h1>
+        <h1 style={S.pt}>Walkthrough Tracker <span style={S.dc}>{active.length}</span></h1>
         <button style={S.pBtn} onClick={() => setShowAdd(true)}>+ NEW HOUSE</button>
       </div>
+      <button style={{ ...S.gBtn, width: "100%", justifyContent: "center", marginBottom: 14 }} onClick={onHelperList}>
+        PRIEB LIST — WHAT'S OPEN IN-HOUSE
+      </button>
       {loading && <div style={S.loading}>LOADING…</div>}
-      {!loading && jobs.length === 0 && <Empty icon="🚶" text="No houses yet. Tap + NEW HOUSE to start a walkthrough." />}
+      {!loading && shown.length === 0 && (
+        <Empty
+          icon={showArchived ? "📦" : "🚶"}
+          text={showArchived ? "No archived houses yet." : "No houses yet. Tap + NEW HOUSE to start a walkthrough."}
+        />
+      )}
       <div style={S.stack}>
-        {jobs.map(j => (
+        {shown.map(j => (
           <div key={j.slug} style={S.card} onClick={() => onOpen(j.slug)}>
             <div style={S.cardRow}>
               <div style={{ flex: 1 }}>
                 <div style={S.addr}>{j.address}</div>
-                {j.closingDate && <div style={S.metaTxt}>Closing {fmtDate(j.closingDate)}</div>}
+                <div style={S.metaTxt}>{closingLabel(j.closingDate)}</div>
               </div>
-              <button style={S.iconBtn} onClick={(e) => onDelete(j.slug, e)}><Trash2 size={14} /></button>
+              {j.archived
+                ? <button style={S.gBtn} onClick={(e) => onUnarchive(j.slug, e)}>RESTORE</button>
+                : <button style={S.iconBtn} onClick={(e) => onDelete(j.slug, e)}><Trash2 size={14} /></button>}
             </div>
           </div>
         ))}
       </div>
+      {archived.length > 0 && (
+        <button
+          style={{ ...S.gBtn, width: "100%", justifyContent: "center", marginTop: 16 }}
+          onClick={() => setShowArchived(v => !v)}
+        >
+          {showArchived ? `← ACTIVE HOUSES (${active.length})` : `SHOW ARCHIVED (${archived.length})`}
+        </button>
+      )}
       {showAdd && (
         <Overlay title="New House">
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
@@ -412,16 +559,14 @@ function JobList({ jobs, loading, onOpen, onCreate, onDelete }) {
 }
 
 // ── Job screen: dictate, review, ship ─────────────────────────────
-function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal, setError }) {
+function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal, onArchive, setError }) {
   const [dictation, setDictation] = useState("");
   const [processing, setProcessing] = useState(false);
   const [pendingItems, setPendingItems] = useState(null); // null = not reviewing; array = reviewing
   const [pendingClosingDate, setPendingClosingDate] = useState(null);
-  const [confirmDictation, setConfirmDictation] = useState("");
-  const [confirmProcessing, setConfirmProcessing] = useState(false);
-  const [pendingConfirmations, setPendingConfirmations] = useState(null); // { matches, unmatched } while reviewing
   const [expandedAssignee, setExpandedAssignee] = useState(null);
   const [exported, setExported] = useState(false); // brief "EXPORTED" confirmation on the button
+  const [copiedPrieb, setCopiedPrieb] = useState(false);
 
   const items = job.items || [];
   const openItems = items.filter(it => it.status === "assignable" || it.status === "sent");
@@ -429,8 +574,20 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
   const selfAssignedOpen = items.filter(it => it.status === "self_assigned");
   const completed = items.filter(it => it.status === "completed");
 
+  // In-house work is pulled out before the trades are grouped, so it never lands
+  // in a vendor card with a report and a "mark as sent" button attached to it —
+  // there's nobody to send it to.
+  const priebOpen = openItems.filter(it => isPrieb(it.assignee));
   const byAssignee = {};
-  openItems.forEach(it => { (byAssignee[it.assignee] = byAssignee[it.assignee] || []).push(it); });
+  openItems.filter(it => !isPrieb(it.assignee)).forEach(it => {
+    (byAssignee[it.assignee] = byAssignee[it.assignee] || []).push(it);
+  });
+
+  const copyPriebList = () => {
+    navigator.clipboard.writeText(buildHelperList([{ address: job.address, items: priebOpen }]));
+    setCopiedPrieb(true);
+    setTimeout(() => setCopiedPrieb(false), 1800);
+  };
 
   const processDictation = async () => {
     if (!dictation.trim()) return;
@@ -456,8 +613,11 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
     setProcessing(true);
     setError(null);
     try {
-      const merged = items.concat(pendingItems);
-      await withRetry(() => backendPost("saveItems", { slug: job.slug, items: merged }));
+      // Only the new items go over the wire. This used to send the whole house
+      // back so the backend could replace every row for the job — which meant a
+      // save could only ever be as correct as the copy the phone happened to be
+      // holding. Appending can't disturb anything it isn't adding.
+      await withRetry(() => backendPost("addItems", { slug: job.slug, items: pendingItems }));
       let newClosingDate = null;
       if (pendingClosingDate && !job.closingDate) {
         await withRetry(() => backendPost("saveJob", { job: { ...job, closingDate: pendingClosingDate } }));
@@ -522,7 +682,7 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
   const saveItemEdit = (item) =>
     optimisticPatch(
       item.id,
-      { room: item.room, item: item.item, assignee: item.assignee },
+      { room: item.room, item: item.item, assignee: item.assignee, notes: item.notes },
       () => backendPost("updateItem", { item }),
       "Couldn't save edit"
     );
@@ -535,51 +695,6 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
       () => backendPost("updateItem", { item: { id: item.id, ...patch } }),
       "Couldn't mark complete"
     );
-  };
-
-  const processConfirmation = async () => {
-    if (!confirmDictation.trim()) return;
-    setConfirmProcessing(true);
-    setError(null);
-    try {
-      const openItemsForMatch = openItems.map(it => ({ id: it.id, room: it.room, item: it.item, assignee: it.assignee }));
-      const result = await withRetry(() => backendPost("parseConfirmation", { dictation: confirmDictation, openItems: openItemsForMatch }));
-      setPendingConfirmations(result);
-    } catch (e) {
-      setError("Couldn't process confirmation (" + e.message + ").");
-    } finally {
-      setConfirmProcessing(false);
-    }
-  };
-
-  const updatePendingMatch = (id, field, value) => {
-    setPendingConfirmations(prev => ({ ...prev, matches: prev.matches.map(m => m.id === id ? { ...m, [field]: value } : m) }));
-  };
-  const removePendingMatch = (id) => {
-    setPendingConfirmations(prev => ({ ...prev, matches: prev.matches.filter(m => m.id !== id) }));
-  };
-
-  const applyConfirmations = async () => {
-    setConfirmProcessing(true);
-    setError(null);
-    try {
-      await withRetry(() => backendPost("applyConfirmations", { matches: pendingConfirmations.matches }));
-      const now = new Date().toISOString();
-      const patches = pendingConfirmations.matches.map(m => {
-        const existing = items.find(it => it.id === m.id);
-        const notes = m.note ? ((existing && existing.notes ? existing.notes + " | " : "") + m.note) : (existing ? existing.notes : "");
-        return m.action === "complete"
-          ? { id: m.id, status: "completed", dateCompleted: now, notes }
-          : { id: m.id, notes };
-      });
-      onApplyLocal({ patches });
-      setPendingConfirmations(null);
-      setConfirmDictation("");
-    } catch (e) {
-      setError("Couldn't apply confirmations (" + e.message + ").");
-    } finally {
-      setConfirmProcessing(false);
-    }
   };
 
   // Manual only — nothing triggers this off a status change. Downloads one .md
@@ -595,21 +710,33 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
     <div>
       <div style={S.ph}>
         <button style={S.gBtn} onClick={onBack}><ArrowLeft size={12} /> BACK</button>
-        <button
-          style={{ ...S.gBtn, opacity: items.length ? 1 : 0.4 }}
-          onClick={exportArchive}
-          disabled={!items.length}
-          title="Download the full punch-list history for this house as a .md file"
-        >
-          <Download size={12} /> {exported ? "EXPORTED" : "EXPORT"}
-        </button>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button
+            style={{ ...S.gBtn, opacity: items.length ? 1 : 0.4 }}
+            onClick={exportArchive}
+            disabled={!items.length}
+            title="Download the full punch-list history for this house as a .md file"
+          >
+            <Download size={12} /> {exported ? "EXPORTED" : "EXPORT"}
+          </button>
+          {!job.archived && (
+            <button
+              style={{ ...S.gBtn, opacity: items.length ? 1 : 0.4 }}
+              onClick={() => onArchive(job)}
+              disabled={!items.length}
+              title="Download the record, then drop this house off the active list. Nothing is deleted."
+            >
+              ARCHIVE
+            </button>
+          )}
+        </div>
       </div>
       <div style={S.dAddr}>{job.address}</div>
-      {job.closingDate && <div style={S.metaTxt}>Closing {fmtDate(job.closingDate)}</div>}
+      <div style={S.metaTxt}>{closingLabel(job.closingDate)}{job.archived ? " · ARCHIVED" : ""}</div>
 
       <div style={S.div} />
 
-      {pendingItems === null && pendingConfirmations === null ? (
+      {pendingItems === null ? (
         <>
           <div style={S.secLbl}>DICTATE WALKTHROUGH</div>
           <textarea
@@ -625,19 +752,24 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
 
           <div style={S.div} />
 
-          <div style={S.secLbl}>CONFIRM PASS (revisit updates)</div>
-          <textarea
-            style={S.dictateArea}
-            rows={4}
-            placeholder="Dictate what you found on a revisit — what's done, what's still pending with any new context…"
-            value={confirmDictation}
-            onChange={e => setConfirmDictation(e.target.value)}
-          />
-          <button style={{ ...S.gBtn, width: "100%", marginTop: 10, justifyContent: "center", opacity: confirmDictation.trim() && !confirmProcessing ? 1 : 0.4 }} onClick={processConfirmation} disabled={!confirmDictation.trim() || confirmProcessing}>
-            {confirmProcessing ? "PROCESSING…" : "PROCESS CONFIRMATION"}
-          </button>
-
-          <div style={S.div} />
+          {/* In-house lane. No report, no email, no "mark as sent" — just the
+              work and a way to copy it into a text message. */}
+          {priebOpen.length > 0 && (
+            <>
+              <div style={S.secLbl}>PRIEB — IN-HOUSE ({priebOpen.length})</div>
+              <button
+                style={{ ...S.gBtn, width: "100%", justifyContent: "center", marginBottom: 10 }}
+                onClick={copyPriebList}
+              >
+                {copiedPrieb ? "✓ COPIED" : "COPY LIST FOR HELPER"}
+              </button>
+              <div style={{ ...S.stack, marginBottom: 24 }}>
+                {priebOpen.map(it => (
+                  <ItemRow key={it.id} item={it} onSave={saveItemEdit} onComplete={markComplete} showAssignee={false} />
+                ))}
+              </div>
+            </>
+          )}
 
           {flagged.length > 0 && (
             <>
@@ -694,16 +826,6 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
             </>
           )}
         </>
-      ) : pendingConfirmations !== null ? (
-        <ReviewConfirmations
-          confirmations={pendingConfirmations}
-          openItems={openItems}
-          onUpdate={updatePendingMatch}
-          onRemove={removePendingMatch}
-          onApply={applyConfirmations}
-          onCancel={() => { setPendingConfirmations(null); }}
-          processing={confirmProcessing}
-        />
       ) : (
         <ReviewPending
           items={pendingItems}
@@ -719,21 +841,117 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
   );
 }
 
+// ── Helper list screen ───────────────────────────────────────────
+// Every open in-house item, by house, highest priority first — and the highest
+// priority house comes pre-selected, because that's the answer most of the time.
+//
+// Selection is deliberate rather than "here's everything." Handing over a list
+// this long is its own failure: too much work in front of someone at once reads
+// as an impossible day, and the order stops meaning anything. One house is the
+// default, adding a second is one tap, and nothing is ever dumped by accident.
+function HelperListScreen({ onBack, setError }) {
+  const [houses, setHouses] = useState(null);
+  const [selected, setSelected] = useState([]);
+  const [copied, setCopied] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        // One request for the whole picture — the backend joins houses to items
+        // and sorts by closing date, so the phone isn't making a call per house.
+        const result = await withRetry(() => backendGet({ action: "listPriebItems" }));
+        const list = result || [];
+        setHouses(list);
+        if (list.length) setSelected([list[0].slug]);
+      } catch (e) {
+        setHouses([]);
+        setError("Couldn't load the Prieb list (" + e.message + ").");
+      }
+    })();
+  }, []);
+
+  const toggle = (slug) =>
+    setSelected(prev => prev.indexOf(slug) === -1 ? prev.concat(slug) : prev.filter(s => s !== slug));
+
+  const chosen = (houses || []).filter(h => selected.indexOf(h.slug) !== -1);
+  const itemCount = chosen.reduce((n, h) => n + h.items.length, 0);
+
+  const copy = () => {
+    navigator.clipboard.writeText(buildHelperList(chosen));
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1800);
+  };
+
+  return (
+    <div>
+      <div style={S.ph}>
+        <button style={S.gBtn} onClick={onBack}><ArrowLeft size={12} /> BACK</button>
+      </div>
+      <div style={S.dAddr}>Prieb — In-House</div>
+      <div style={S.metaTxt}>Open items, soonest closing first. Tap a house to include it.</div>
+
+      <div style={S.div} />
+
+      {houses === null && <div style={S.loading}>LOADING…</div>}
+      {houses !== null && houses.length === 0 && <Empty icon="✅" text="Nothing open in-house right now." />}
+
+      <div style={S.stack}>
+        {(houses || []).map(h => {
+          const on = selected.indexOf(h.slug) !== -1;
+          return (
+            <div
+              key={h.slug}
+              style={{ ...S.card, borderColor: on ? "rgba(34,197,94,0.4)" : undefined, opacity: on ? 1 : 0.55 }}
+              onClick={() => toggle(h.slug)}
+            >
+              <div style={S.cardRow}>
+                <div style={{ flex: 1 }}>
+                  <div style={S.addr}>{h.address}</div>
+                  <div style={S.metaTxt}>{closingLabel(h.closingDate)} · {h.items.length} open</div>
+                </div>
+                {on ? <CheckCircle2 size={16} /> : <Badge color="amber">OFF</Badge>}
+              </div>
+              {on && (
+                <div style={{ marginTop: 10 }}>
+                  {h.items.map(it => (
+                    <div key={it.id} style={{ ...S.metaTxt, marginBottom: 3 }}>• {it.room}: {it.item}</div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {itemCount > 0 && (
+        <button style={{ ...S.pBtn, width: "100%", justifyContent: "center", marginTop: 16 }} onClick={copy}>
+          {copied ? "✓ COPIED" : `COPY ${itemCount} ITEM${itemCount === 1 ? "" : "S"}`}
+        </button>
+      )}
+    </div>
+  );
+}
+
 function ItemRow({ item, onSave, onComplete, showAssignee }) {
   const [editing, setEditing] = useState(false);
   const [room, setRoom] = useState(item.room);
   const [text, setText] = useState(item.item);
   const [assignee, setAssignee] = useState(item.assignee);
+  const [notes, setNotes] = useState(item.notes || "");
 
-  const save = () => { onSave({ ...item, room, item: text, assignee }); setEditing(false); };
-  const cancel = () => { setRoom(item.room); setText(item.item); setAssignee(item.assignee); setEditing(false); };
+  const save = () => { onSave({ ...item, room, item: text, assignee, notes }); setEditing(false); };
+  const cancel = () => { setRoom(item.room); setText(item.item); setAssignee(item.assignee); setNotes(item.notes || ""); setEditing(false); };
 
   if (editing) {
     return (
       <div style={S.reviewRow}>
         <input style={{ ...S.tIn, marginBottom: 6, width: "100%" }} value={room} onChange={e => setRoom(e.target.value)} placeholder="Room" />
         <input style={{ ...S.tIn, marginBottom: 6, width: "100%" }} value={text} onChange={e => setText(e.target.value)} placeholder="Item" />
-        {showAssignee && <input style={{ ...S.tIn, marginBottom: 8, width: "100%" }} value={assignee} onChange={e => setAssignee(e.target.value)} placeholder="Assignee" />}
+        {showAssignee && <input style={{ ...S.tIn, marginBottom: 6, width: "100%" }} value={assignee} onChange={e => setAssignee(e.target.value)} placeholder="Assignee" />}
+        {/* Notes are the follow-up history. They're what ends up in the archive
+            explaining why something took three trips, so the field is a textarea
+            rather than a one-line input — these get written as sentences. */}
+        <textarea style={{ ...S.tIn, marginBottom: 8, width: "100%", minHeight: 56, resize: "vertical" }} rows={2} value={notes} onChange={e => setNotes(e.target.value)} placeholder="Notes — what happened, what it's waiting on…" />
         <div style={{ display: "flex", gap: 6 }}>
           <button style={S.gBtn} onClick={cancel}>CANCEL</button>
           <button style={S.pBtn} onClick={save}>SAVE</button>
@@ -759,16 +977,18 @@ function CompletedItemRow({ item, onSave, onReopen }) {
   const [room, setRoom] = useState(item.room);
   const [text, setText] = useState(item.item);
   const [assignee, setAssignee] = useState(item.assignee);
+  const [notes, setNotes] = useState(item.notes || "");
 
-  const save = () => { onSave({ ...item, room, item: text, assignee }); setEditing(false); };
-  const cancel = () => { setRoom(item.room); setText(item.item); setAssignee(item.assignee); setEditing(false); };
+  const save = () => { onSave({ ...item, room, item: text, assignee, notes }); setEditing(false); };
+  const cancel = () => { setRoom(item.room); setText(item.item); setAssignee(item.assignee); setNotes(item.notes || ""); setEditing(false); };
 
   if (editing) {
     return (
       <div style={S.reviewRow}>
         <input style={{ ...S.tIn, marginBottom: 6, width: "100%" }} value={room} onChange={e => setRoom(e.target.value)} placeholder="Room" />
         <input style={{ ...S.tIn, marginBottom: 6, width: "100%" }} value={text} onChange={e => setText(e.target.value)} placeholder="Item" />
-        <input style={{ ...S.tIn, marginBottom: 8, width: "100%" }} value={assignee} onChange={e => setAssignee(e.target.value)} placeholder="Assignee" />
+        <input style={{ ...S.tIn, marginBottom: 6, width: "100%" }} value={assignee} onChange={e => setAssignee(e.target.value)} placeholder="Assignee" />
+        <textarea style={{ ...S.tIn, marginBottom: 8, width: "100%", minHeight: 56, resize: "vertical" }} rows={2} value={notes} onChange={e => setNotes(e.target.value)} placeholder="Notes — what happened, what it's waiting on…" />
         <div style={{ display: "flex", gap: 6 }}>
           <button style={S.gBtn} onClick={cancel}>CANCEL</button>
           <button style={S.pBtn} onClick={save}>SAVE</button>
@@ -780,6 +1000,7 @@ function CompletedItemRow({ item, onSave, onReopen }) {
   return (
     <div style={{ ...S.itemRow, opacity: 0.75 }}>
       <div style={S.itemText}>{item.room}: {item.item} <span style={{ color: "#6b7280" }}>· {item.assignee}</span></div>
+      {item.notes && <div style={{ ...S.metaTxt, fontStyle: "italic" }}>{item.notes}</div>}
       {item.dateCompleted && <div style={{ ...S.metaTxt, color: "#4ade80" }}>Verified complete {fmtDate(item.dateCompleted)}</div>}
       <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
         <button style={S.gBtn} onClick={() => setEditing(true)}>EDIT</button>
@@ -788,52 +1009,6 @@ function CompletedItemRow({ item, onSave, onReopen }) {
     </div>
   );
 }
-
-function ReviewConfirmations({ confirmations, openItems, onUpdate, onRemove, onApply, onCancel, processing }) {
-  const itemById = {};
-  openItems.forEach(it => { itemById[it.id] = it; });
-  return (
-    <div>
-      <div style={S.secLbl}>REVIEW CONFIRMATION MATCHES</div>
-      <div style={{ ...S.stack, marginBottom: 16 }}>
-        {confirmations.matches.map(m => {
-          const it = itemById[m.id];
-          return (
-            <div key={m.id} style={S.reviewRow}>
-              <div style={S.itemText}>{it ? `${it.room}: ${it.item}` : m.id}</div>
-              <div style={{ display: "flex", gap: 6, margin: "8px 0 6px" }}>
-                <select style={S.tIn} value={m.action} onChange={e => onUpdate(m.id, "action", e.target.value)}>
-                  <option value="complete">Mark Complete</option>
-                  <option value="note">Add Note Only</option>
-                </select>
-                <button style={S.iconBtn} onClick={() => onRemove(m.id)}><Trash2 size={13} /></button>
-              </div>
-              <input style={{ ...S.tIn, width: "100%" }} value={m.note || ""} onChange={e => onUpdate(m.id, "note", e.target.value)} placeholder="Note (optional)" />
-            </div>
-          );
-        })}
-        {confirmations.matches.length === 0 && <div style={S.metaTxt}>No confident matches found.</div>}
-      </div>
-      {confirmations.unmatched && confirmations.unmatched.length > 0 && (
-        <>
-          <div style={S.secLbl}>COULDN'T CONFIDENTLY MATCH</div>
-          <div style={{ ...S.stack, marginBottom: 16 }}>
-            {confirmations.unmatched.map((u, i) => (
-              <div key={i} style={{ ...S.itemRow, borderColor: "rgba(245,158,11,0.3)" }}>
-                <div style={S.itemText}>{u}</div>
-              </div>
-            ))}
-          </div>
-        </>
-      )}
-      <div style={S.mBtns}>
-        <button style={S.gBtn} onClick={onCancel}>CANCEL</button>
-        <button style={{ ...S.pBtn, opacity: processing ? 0.5 : 1 }} onClick={onApply} disabled={processing || confirmations.matches.length === 0}>{processing ? "APPLYING…" : "APPLY"}</button>
-      </div>
-    </div>
-  );
-}
-
 function FlaggedRow({ item, onResolve }) {
   const [reassign, setReassign] = useState("");
   return (
