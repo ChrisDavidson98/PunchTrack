@@ -270,11 +270,23 @@ function patchRows(sh, shouldPatch, makePatch) {
 
 // ── Jobs ─────────────────────────────────────────────────────────
 
-// Sheets will hand back a closingDate as either a plain "YYYY-MM-DD" string or its
-// own Date type depending on how the cell got written, so normalize to the date part
-// before comparing. Same defensive slice the frontend does.
+// Sheets hands back a closingDate as either a plain "YYYY-MM-DD" string or its own
+// Date type, depending on how the cell got written. Normalize both to "YYYY-MM-DD"
+// so they sort as plain text.
+//
+// The Date branch is not optional. Server-side the cell really is a Date object —
+// it only turns into an ISO string later, when the response is serialized to JSON.
+// String(aDate) gives "Mon Sep 28 2026 …", so slicing the first 10 characters
+// yields "Mon Sep 28", every house ends up with an empty key, and the whole list
+// silently falls back to creation order. The frontend never sees this because by
+// then it's a string.
 function closingKey(job) {
-  const raw = String(job.closingDate || '').slice(0, 10);
+  const v = job.closingDate;
+  if (!v) return '';
+  if (Object.prototype.toString.call(v) === '[object Date]') {
+    return isNaN(v.getTime()) ? '' : Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  }
+  const raw = String(v).slice(0, 10);
   return /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : '';
 }
 
