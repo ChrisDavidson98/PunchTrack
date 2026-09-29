@@ -3,7 +3,7 @@
  * ================================================
  * Mirrors the Scope Deviation backend's pattern:
  *  - GET  requests => read actions   (listJobs, getJob, listPriebItems)
- *  - POST requests => write/AI actions (createJob, saveJob, deleteJob, parseDictation)
+ *  - POST requests => write/AI actions (createJob, saveJob, deleteJob, checkIn, parseDictation)
  *  - CORS: POST bodies must stay text/plain (avoids preflight); response always JSON.
  *
  * SETUP
@@ -25,6 +25,7 @@
  * -----------------------------------------------------
  * Jobs:  slug | address | closingDate | createdAt | lastUpdated | archived
  * Items: id | slug | room | item | assignee | status | dateLogged | dateSent | notes | dateCompleted
+ * Visits: slug | date | openItemIds | completedItemIds | lastAt   (see "Visits" below)
  *   status ∈ "assignable" | "flagged" | "self_assigned" | "sent" | "completed"
  *   (an assignable item becomes "sent" once its report ships; flagged/self_assigned
  *    items are tracked but never auto-transition to "sent" via report-shipping —
@@ -43,9 +44,11 @@ const CLAUDE_MODEL = 'claude-sonnet-4-5-20250929'; // update if you want a diffe
 
 const JOBS_SHEET = 'Jobs';
 const ITEMS_SHEET = 'Items';
+const VISITS_SHEET = 'Visits';
 
 const JOBS_HEADERS = ['slug', 'address', 'closingDate', 'createdAt', 'lastUpdated', 'archived'];
 const ITEMS_HEADERS = ['id', 'slug', 'room', 'item', 'assignee', 'status', 'dateLogged', 'dateSent', 'notes', 'dateCompleted'];
+const VISITS_HEADERS = ['slug', 'date', 'openItemIds', 'completedItemIds', 'lastAt'];
 
 // ── The Prieb lane ───────────────────────────────────────────────
 // Items assigned to Prieb are in-house work — they go to the helper, or to Chris
@@ -138,6 +141,7 @@ function doPost(e) {
     if (action === 'addItems') { checkRateLimit('write', RATE_LIMIT_MAX_WRITES); return respond(withLock(() => addItems(body.slug, body.items))); }
     if (action === 'shipReport') { checkRateLimit('write', RATE_LIMIT_MAX_WRITES); return respond(withLock(() => shipReport(body.slug, body.assignee))); }
     if (action === 'resolveFlag') { checkRateLimit('write', RATE_LIMIT_MAX_WRITES); return respond(withLock(() => resolveFlag(body.itemId, body.resolution))); }
+    if (action === 'checkIn') { checkRateLimit('write', RATE_LIMIT_MAX_WRITES); return respond(withLock(() => checkIn(body.slug))); }
     if (action === 'updateItem') { checkRateLimit('write', RATE_LIMIT_MAX_WRITES); return respond(withLock(() => updateItem(body.item))); }
     if (action === 'parseDictation') {
       checkRateLimit('ai', RATE_LIMIT_MAX_AI);
@@ -281,7 +285,12 @@ function patchRows(sh, shouldPatch, makePatch) {
 // silently falls back to creation order. The frontend never sees this because by
 // then it's a string.
 function closingKey(job) {
-  const v = job.closingDate;
+  return dayKey(job.closingDate);
+}
+
+// Same normalization for any date cell — the Visits sheet's `date` column gets
+// auto-converted to a Sheets Date exactly the way closingDate does.
+function dayKey(v) {
   if (!v) return '';
   if (Object.prototype.toString.call(v) === '[object Date]') {
     return isNaN(v.getTime()) ? '' : Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy-MM-dd');
@@ -296,7 +305,8 @@ function closingKey(job) {
 // first among themselves) rather than being treated as infinitely urgent.
 function listJobs() {
   const sh = getSheet(JOBS_SHEET, JOBS_HEADERS);
-  return sheetToObjects(sh).sort((a, b) => {
+  const last = lastVisitBySlug();
+  return sheetToObjects(sh).map(j => ({ ...j, lastVisit: last[j.slug] || '' })).sort((a, b) => {
     const ka = closingKey(a), kb = closingKey(b);
     if (ka && kb) return ka < kb ? -1 : ka > kb ? 1 : 0;
     if (ka) return -1;
@@ -313,7 +323,7 @@ function getJob(slug) {
   const itemsSh = getSheet(ITEMS_SHEET, ITEMS_HEADERS);
   const items = sheetToObjects(itemsSh).filter(it => it.slug === slug);
 
-  return { ...job, items };
+  return { ...job, items, visits: visitsFor(slug) };
 }
 
 function createJob(job) {
@@ -353,6 +363,10 @@ function deleteJob(slug) {
   const items = sheetToObjects(itemsSh).filter(it => it.slug !== slug);
   objectsToSheet(itemsSh, ITEMS_HEADERS, items);
 
+  const visitsSh = getSheet(VISITS_SHEET, VISITS_HEADERS);
+  const visits = sheetToObjects(visitsSh).filter(v => v.slug !== slug);
+  objectsToSheet(visitsSh, VISITS_HEADERS, visits);
+
   return { ok: true };
 }
 
@@ -370,6 +384,7 @@ function addItems(slug, items) {
     return head.map(h => (row[h] !== undefined && row[h] !== null ? row[h] : ''));
   });
   sh.getRange(sh.getLastRow() + 1, 1, rows.length, head.length).setValues(rows);
+  safeLogVisit(slug, []); // dictating a walk = standing in the house
   return { ok: true, count: rows.length };
 }
 
@@ -402,12 +417,17 @@ function resolveFlag(itemId, resolution) {
 // and tap-to-complete (pass { id, status: "completed", dateCompleted: <iso> }).
 function updateItem(item) {
   const sh = getSheet(ITEMS_SHEET, ITEMS_HEADERS);
-  const n = patchRows(sh, it => it.id === item.id, () => {
+  let slug = '';
+  const n = patchRows(sh, it => it.id === item.id, it => {
+    slug = it.slug;
     const patch = { ...item };
     delete patch.id; // never rewrite the key we matched on
     return patch;
   });
   if (!n) throw new Error('Item not found: ' + item.id);
+  // Completing an item counts as a visit. Edits, reopens and flag resolves don't —
+  // those are as likely to happen from the truck or the office as on site.
+  if (item.status === 'completed') safeLogVisit(slug, [item.id]);
   return { ok: true };
 }
 
@@ -520,4 +540,82 @@ RULES:
   }));
 
   return { closingDate: parsed.closingDate || null, items };
+}
+
+// ── Visits ("last checked") ──────────────────────────────────────
+// One row per house per day Chris was there. A visit is logged by exactly three
+// things: dictating new items, marking an item complete, or tapping CHECKED TODAY.
+// Nothing else counts — an edit or a reopen is as likely to be office work.
+//
+// Each row snapshots which items were still open when he was there. That snapshot
+// is the dispute trail: "still open on 9/19, 9/23, 9/26" is just every row whose
+// openItemIds contains the item. "Last checked" for a house is its newest row.
+// Both are computed from this log rather than stored separately, so they can
+// never disagree with it.
+//
+// "Open" = every item that isn't completed, whatever its status or lane.
+//
+// Same day, same house → the existing row is updated, not duplicated. The open
+// list is replaced with the latest snapshot (what was still open when he left);
+// completed IDs accumulate across the day.
+function logVisit(slug, completedIds) {
+  if (!slug) return;
+  const tz = Session.getScriptTimeZone();
+  const now = new Date();
+  const today = Utilities.formatDate(now, tz, 'yyyy-MM-dd');
+
+  const items = sheetToObjects(getSheet(ITEMS_SHEET, ITEMS_HEADERS)).filter(it => it.slug === slug);
+  const open = items.filter(it => it.status !== 'completed').map(it => it.id);
+
+  const sh = getSheet(VISITS_SHEET, VISITS_HEADERS);
+  const n = patchRows(sh, v => v.slug === slug && dayKey(v.date) === today, v => {
+    const done = splitIds(v.completedItemIds);
+    (completedIds || []).forEach(id => { if (done.indexOf(id) === -1) done.push(id); });
+    return {
+      openItemIds: open.filter(id => done.indexOf(id) === -1).join(','),
+      completedItemIds: done.join(','),
+      lastAt: now.toISOString(),
+    };
+  });
+  if (n) return;
+
+  const done = completedIds || [];
+  const row = { slug, date: today, openItemIds: open.filter(id => done.indexOf(id) === -1).join(','), completedItemIds: done.join(','), lastAt: now.toISOString() };
+  const head = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+  sh.appendRow(head.map(h => (row[h] !== undefined ? row[h] : '')));
+}
+
+// A visit log that fails to write must never fail the item write it rode along
+// with — the completion or the new items are what matter; the visit is a bonus.
+function safeLogVisit(slug, completedIds) {
+  try { logVisit(slug, completedIds); } catch (e) { console.error('logVisit failed: ' + e.message); }
+}
+
+// CHECKED TODAY — for a walk where nothing got finished. Unlike the automatic
+// logging above, this one is the whole point of the request, so errors surface.
+function checkIn(slug) {
+  if (!slug) throw new Error('Missing slug');
+  logVisit(slug, []);
+  return { ok: true };
+}
+
+function splitIds(v) {
+  return String(v || '').split(',').map(x => x.trim()).filter(Boolean);
+}
+
+function visitsFor(slug) {
+  return sheetToObjects(getSheet(VISITS_SHEET, VISITS_HEADERS))
+    .filter(v => v.slug === slug)
+    .map(v => ({ date: dayKey(v.date), openItemIds: splitIds(v.openItemIds), completedItemIds: splitIds(v.completedItemIds) }))
+    .filter(v => v.date)
+    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+}
+
+function lastVisitBySlug() {
+  const out = {};
+  sheetToObjects(getSheet(VISITS_SHEET, VISITS_HEADERS)).forEach(v => {
+    const d = dayKey(v.date);
+    if (d && (!out[v.slug] || d > out[v.slug])) out[v.slug] = d;
+  });
+  return out;
 }

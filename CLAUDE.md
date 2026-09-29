@@ -122,6 +122,9 @@ self_assigned items never auto-transition — self_assigned items get marked sen
 Chris ships/acknowledges his own list, flagged items only leave "flagged" when
 manually resolved in the UI.
 
+`Visits` sheet: slug | date | openItemIds | completedItemIds | lastAt — one row per
+house per day (see "Visits" below).
+
 `archived` is "" while a house is active and an ISO timestamp once archived.
 Archiving is not deleting: the house drops off the active list and out of helper
 lists, every row stays. `deleteJob` still hard-deletes and is a separate thing.
@@ -147,6 +150,24 @@ backend's own 60-reads-per-minute limit on a single screen load.
 
 The helper list is a filter and a sort, not a question — **no API call, no cost.**
 Don't "upgrade" it to an AI ask bar without being asked.
+
+### Visits — "last checked" (added 2026-09-29, spec: SPEC-Integration-and-LastChecked.md)
+A visit is logged **only** by: dictating new items (`addItems`), completing an item
+(`updateItem` with status completed), or tapping CHECKED TODAY (`checkIn`). Edits,
+reopens, flag resolves and shipping reports do not count. Only Chris uses the app,
+so there's no "who" field. Each row snapshots every item that isn't `completed`
+(all statuses, all lanes) as "still open"; same-day repeats update one row.
+"Last checked" (`lastVisit` on `listJobs`) and the per-item dispute trail
+(`visits` on `getJob`) are computed from this log, never stored separately.
+Visit logging inside item writes is best-effort (`safeLogVisit`) — it must never
+fail the item write.
+
+Overdue rule, counted in **workdays (Mon–Fri)**, never flagged Sat/Sun:
+>14 days to closing or no date → 3+; 8–14 → 2+; ≤7 → 1+ (i.e. not visited today).
+It's a badge only — **it never changes sort order.** In the app an item's trail is
+a summary ("Open on N visits · first · last"), full list one tap away; the `.md`
+archive prints every date. Next planned step: PunchTrack as the Punch tab inside
+BuildTrackUnified (Part 1 of that spec).
 
 ### Security status — has auth and rate limiting
 - `checkToken()` is enforced on every GET/POST action.

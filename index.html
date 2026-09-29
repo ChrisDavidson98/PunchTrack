@@ -118,6 +118,63 @@ function fmtDate(d) {
   const parsed = parseLocalDate(d);
   return parsed ? parsed.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "";
 }
+function fmtShort(d) {
+  const parsed = parseLocalDate(d);
+  return parsed ? parsed.toLocaleDateString("en-US", { month: "numeric", day: "numeric" }) : "";
+}
+
+// ── Visits ("last checked") ──────────────────────────────────────
+// The backend logs a visit (one per house per day) whenever Chris dictates items,
+// completes one, or taps CHECKED TODAY — see the Visits section of Code.gs. This
+// side only reads that log: when was the house last checked, is it overdue, and
+// which visits saw a given item still open.
+function todayKey() {
+  const d = new Date();
+  const p = n => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+// Workdays (Mon–Fri) after `dateStr`, up to and including today. Weekends never
+// count toward the clock — confirmed with Chris 2026-09-29.
+function workdaysSince(dateStr) {
+  const d = parseLocalDate(dateStr);
+  if (!d) return null;
+  const today = parseLocalDate(todayKey());
+  let n = 0;
+  while (d < today) {
+    d.setDate(d.getDate() + 1);
+    const day = d.getDay();
+    if (day !== 0 && day !== 6) n++;
+  }
+  return n;
+}
+
+// How often a house has to be walked tightens as closing gets close:
+//   > 14 days out (or no closing date)  → overdue after 3 workdays
+//   8–14 days out                       → after 2 (every other day)
+//   7 days or less                      → after 1 (daily; flagged the next workday)
+// Nothing is ever flagged on a Saturday or Sunday.
+//
+// This is a badge only. It never changes sort order — soonest closing stays the
+// one priority rule.
+function visitStatus(job) {
+  const visits = job.visits || [];
+  const last = job.lastVisit || (visits.length ? visits[visits.length - 1].date : "");
+  // A house that's never had a logged visit counts from the day it was created.
+  const since = last || String(job.createdAt || "").slice(0, 10);
+  const days = daysUntil(job.closingDate);
+  const limit = days === null || days > 14 ? 3 : days >= 8 ? 2 : 1;
+  const ago = workdaysSince(since);
+  const weekend = [0, 6].indexOf(new Date().getDay()) !== -1;
+  const overdue = !job.archived && !weekend && ago !== null && ago >= limit;
+  const label = !last ? "Never checked" : last === todayKey() ? "Checked today" : `Last checked ${fmtDate(last)}`;
+  return { last, label, overdue };
+}
+
+// Every visit that saw this item still open, oldest first — the dispute trail.
+function openTrail(visits, id) {
+  return (visits || []).filter(v => (v.openItemIds || []).indexOf(id) !== -1).map(v => v.date);
+}
 
 // Walk back N *working* days (Mon-Fri) from a date, skipping weekends.
 function workingDaysBefore(dateStr, n) {
@@ -144,6 +201,7 @@ function workingDaysBefore(dateStr, n) {
 // trail, not an outstanding-work list.
 function buildArchiveMarkdown(job, now = new Date()) {
   const items = job.items || [];
+  const visits = job.visits || [];
 
   // Group by assignee in first-appearance order, which is sheet row order, which
   // is the order things were dictated. Same grouping the job screen does, just
@@ -164,6 +222,7 @@ function buildArchiveMarkdown(job, now = new Date()) {
     `Walkthrough Items — generated ${fmtDate(now.toISOString())}`,
     job.closingDate ? `Closing ${fmtDate(job.closingDate)}` : "Closing date not set",
     `${items.length} items logged — ${done} done, ${items.length - done} still open`,
+    visits.length ? `${visits.length} visit${visits.length === 1 ? "" : "s"} logged — ${visits.map(v => fmtDate(v.date)).join(", ")}` : "No visits logged",
   ];
 
   order.forEach(who => {
@@ -188,6 +247,10 @@ function buildArchiveMarkdown(job, now = new Date()) {
       // trip, still not right." Often the only written record of why something
       // dragged, so they ride along under their item.
       if (it.notes) lines.push(`  - ${it.notes}`);
+      // The dispute trail, in full — every visit that saw this still open. In
+      // the app it's summarized; the permanent record keeps every date.
+      const trail = openTrail(visits, it.id);
+      if (trail.length) lines.push(`  - still open on: ${trail.map(fmtDate).join(", ")}`);
     });
   });
 
@@ -434,6 +497,26 @@ function App() {
     });
   };
 
+  // Mirror of the backend's logVisit, so "Checked today" and the item trails
+  // update the instant something counts as a visit. Call it *after* the item
+  // patch — React applies these in order, so the open snapshot sees the change.
+  const recordVisitLocally = (slug, completedId) => {
+    const today = todayKey();
+    setActiveJob(prev => {
+      if (!prev || prev.slug !== slug) return prev;
+      const visits = (prev.visits || []).slice();
+      const i = visits.findIndex(v => v.date === today);
+      const was = i >= 0 ? visits[i] : { date: today, openItemIds: [], completedItemIds: [] };
+      const done = completedId && was.completedItemIds.indexOf(completedId) === -1
+        ? was.completedItemIds.concat(completedId) : was.completedItemIds;
+      const open = prev.items.filter(it => it.status !== "completed" && done.indexOf(it.id) === -1).map(it => it.id);
+      const next = { date: today, openItemIds: open, completedItemIds: done };
+      if (i >= 0) visits[i] = next; else visits.push(next);
+      return { ...prev, visits, lastVisit: today };
+    });
+    setJobs(prev => prev.map(j => j.slug === slug ? { ...j, lastVisit: today } : j));
+  };
+
   const openReport = (assignee) => { setReportAssignee(assignee); setScreen("report"); };
 
   return (
@@ -469,6 +552,7 @@ function App() {
                 onOpenReport={openReport}
                 onUpdateItemLocal={updateItemLocally}
                 onApplyLocal={applyLocalChanges}
+                onVisitLocal={recordVisitLocally}
                 onArchive={archiveJob}
                 setError={setError}
               />
@@ -520,7 +604,12 @@ function JobList({ jobs, loading, onOpen, onCreate, onDelete, onUnarchive, onHel
               <div style={{ flex: 1 }}>
                 <div style={S.addr}>{j.address}</div>
                 <div style={S.metaTxt}>{closingLabel(j.closingDate)}</div>
+                {!j.archived && (() => {
+                  const vs = visitStatus(j);
+                  return <div style={{ ...S.metaTxt, color: vs.overdue ? "#f59e0b" : S.metaTxt.color }}>{vs.label}</div>;
+                })()}
               </div>
+              {!j.archived && visitStatus(j).overdue && <Badge color="amber">NEEDS A VISIT</Badge>}
               {j.archived
                 ? <button style={S.gBtn} onClick={(e) => onUnarchive(j.slug, e)}>RESTORE</button>
                 : <button style={S.iconBtn} onClick={(e) => onDelete(j.slug, e)}><Trash2 size={14} /></button>}
@@ -559,7 +648,7 @@ function JobList({ jobs, loading, onOpen, onCreate, onDelete, onUnarchive, onHel
 }
 
 // ── Job screen: dictate, review, ship ─────────────────────────────
-function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal, onArchive, setError }) {
+function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal, onVisitLocal, onArchive, setError }) {
   const [dictation, setDictation] = useState("");
   const [processing, setProcessing] = useState(false);
   const [pendingItems, setPendingItems] = useState(null); // null = not reviewing; array = reviewing
@@ -624,6 +713,7 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
         newClosingDate = pendingClosingDate;
       }
       onApplyLocal({ newItems: pendingItems, closingDate: newClosingDate });
+      onVisitLocal(job.slug); // the backend logged this walk inside addItems
       setPendingItems(null);
       setPendingClosingDate(null);
       setDictation("");
@@ -689,13 +779,28 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
 
   const markComplete = (item) => {
     const patch = { status: "completed", dateCompleted: new Date().toISOString() };
-    return optimisticPatch(
+    const write = optimisticPatch(
       item.id,
       patch,
       () => backendPost("updateItem", { item: { id: item.id, ...patch } }),
       "Couldn't mark complete"
     );
+    // Completing counts as a visit — shown now, logged by the backend with the
+    // write. Queued after the item patch above, so the open snapshot sees it.
+    onVisitLocal(job.slug, item.id);
+    return write;
   };
+
+  // For a walk where nothing got finished — the only way that visit gets logged.
+  const checkIn = async () => {
+    setError(null);
+    onVisitLocal(job.slug);
+    try { await withRetry(() => backendPost("checkIn", { slug: job.slug })); }
+    catch (e) { setError("Couldn't log the visit (" + e.message + ")."); }
+  };
+  const visits = job.visits || [];
+  const trailFor = (id) => openTrail(visits, id);
+  const vs = visitStatus(job);
 
   // Manual only — nothing triggers this off a status change. Downloads one .md
   // covering every item ever logged here; see buildArchiveMarkdown.
@@ -733,6 +838,20 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
       </div>
       <div style={S.dAddr}>{job.address}</div>
       <div style={S.metaTxt}>{closingLabel(job.closingDate)}{job.archived ? " · ARCHIVED" : ""}</div>
+      {!job.archived && (
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginTop: 10 }}>
+          <div style={{ ...S.metaTxt, marginTop: 0, fontSize: 11, color: vs.overdue ? "#f59e0b" : S.metaTxt.color }}>
+            {vs.label}{vs.overdue ? " — needs a visit" : ""}
+          </div>
+          <button
+            style={{ ...S.gBtn, opacity: vs.last === todayKey() ? 0.5 : 1 }}
+            onClick={checkIn}
+            title="Log that you walked this house today, even if nothing got finished"
+          >
+            <CheckCircle2 size={12} /> CHECKED TODAY
+          </button>
+        </div>
+      )}
 
       <div style={S.div} />
 
@@ -765,7 +884,7 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
               </button>
               <div style={{ ...S.stack, marginBottom: 24 }}>
                 {priebOpen.map(it => (
-                  <ItemRow key={it.id} item={it} onSave={saveItemEdit} onComplete={markComplete} showAssignee={false} />
+                  <ItemRow key={it.id} item={it} onSave={saveItemEdit} onComplete={markComplete} showAssignee={false} trail={trailFor(it.id)} />
                 ))}
               </div>
             </>
@@ -775,7 +894,7 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
             <>
               <div style={S.secLbl}><AlertTriangle size={11} style={{ marginRight: 4, verticalAlign: -1 }} />NEEDS MY FOLLOW-UP ({flagged.length})</div>
               <div style={{ ...S.stack, marginBottom: 24 }}>
-                {flagged.map(it => <FlaggedRow key={it.id} item={it} onResolve={resolveFlaggedItem} />)}
+                {flagged.map(it => <FlaggedRow key={it.id} item={it} onResolve={resolveFlaggedItem} trail={trailFor(it.id)} />)}
               </div>
             </>
           )}
@@ -785,7 +904,7 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
               <div style={S.secLbl}>INTERNAL FOLLOW-UP (CHRIS — NO EMAIL NEEDED)</div>
               <div style={{ ...S.stack, marginBottom: 24 }}>
                 {selfAssignedOpen.map(it => (
-                  <ItemRow key={it.id} item={it} onSave={saveItemEdit} onComplete={markComplete} showAssignee={false} />
+                  <ItemRow key={it.id} item={it} onSave={saveItemEdit} onComplete={markComplete} showAssignee={false} trail={trailFor(it.id)} />
                 ))}
               </div>
             </>
@@ -808,7 +927,7 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
                   </div>
                   {expanded && (
                     <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
-                      {its.map(it => <ItemRow key={it.id} item={it} onSave={saveItemEdit} onComplete={markComplete} showAssignee={true} />)}
+                      {its.map(it => <ItemRow key={it.id} item={it} onSave={saveItemEdit} onComplete={markComplete} showAssignee={true} trail={trailFor(it.id)} />)}
                       <button style={{ ...S.gBtn, justifyContent: "center" }} onClick={() => onOpenReport(assignee)}>VIEW REPORT →</button>
                     </div>
                   )}
@@ -821,7 +940,7 @@ function JobScreen({ job, onBack, onOpenReport, onUpdateItemLocal, onApplyLocal,
             <>
               <div style={{ ...S.secLbl, marginTop: 24 }}>COMPLETED ({completed.length})</div>
               <div style={S.stack}>
-                {completed.map(it => <CompletedItemRow key={it.id} item={it} onSave={saveItemEdit} onReopen={reopenItem} />)}
+                {completed.map(it => <CompletedItemRow key={it.id} item={it} onSave={saveItemEdit} onReopen={reopenItem} trail={trailFor(it.id)} />)}
               </div>
             </>
           )}
@@ -932,7 +1051,7 @@ function HelperListScreen({ onBack, setError }) {
   );
 }
 
-function ItemRow({ item, onSave, onComplete, showAssignee }) {
+function ItemRow({ item, onSave, onComplete, showAssignee, trail }) {
   const [editing, setEditing] = useState(false);
   const [room, setRoom] = useState(item.room);
   const [text, setText] = useState(item.item);
@@ -964,6 +1083,7 @@ function ItemRow({ item, onSave, onComplete, showAssignee }) {
     <div style={S.itemRow}>
       <div style={S.itemText}>{item.room}: {item.item}</div>
       {item.notes && <div style={{ ...S.metaTxt, fontStyle: "italic" }}>{item.notes}</div>}
+      <OpenTrail dates={trail} />
       <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
         <button style={S.gBtn} onClick={() => setEditing(true)}>EDIT</button>
         <button style={{ ...S.gBtn, color: "#4ade80", borderColor: "rgba(34,197,94,0.35)" }} onClick={() => onComplete(item)}><CheckCircle2 size={12} /> COMPLETE</button>
@@ -972,7 +1092,7 @@ function ItemRow({ item, onSave, onComplete, showAssignee }) {
   );
 }
 
-function CompletedItemRow({ item, onSave, onReopen }) {
+function CompletedItemRow({ item, onSave, onReopen, trail }) {
   const [editing, setEditing] = useState(false);
   const [room, setRoom] = useState(item.room);
   const [text, setText] = useState(item.item);
@@ -1002,6 +1122,7 @@ function CompletedItemRow({ item, onSave, onReopen }) {
       <div style={S.itemText}>{item.room}: {item.item} <span style={{ color: "#6b7280" }}>· {item.assignee}</span></div>
       {item.notes && <div style={{ ...S.metaTxt, fontStyle: "italic" }}>{item.notes}</div>}
       {item.dateCompleted && <div style={{ ...S.metaTxt, color: "#4ade80" }}>Verified complete {fmtDate(item.dateCompleted)}</div>}
+      <OpenTrail dates={trail} />
       <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
         <button style={S.gBtn} onClick={() => setEditing(true)}>EDIT</button>
         <button style={S.gBtn} onClick={() => onReopen(item)}>REOPEN</button>
@@ -1009,12 +1130,32 @@ function CompletedItemRow({ item, onSave, onReopen }) {
     </div>
   );
 }
-function FlaggedRow({ item, onResolve }) {
+// The dispute trail on an item: a one-line summary, full date list one tap away.
+// ("Still open on 9/19, 9/23, 9/26" is what settles "we finished that last week.")
+function OpenTrail({ dates }) {
+  const [open, setOpen] = useState(false);
+  if (!dates || !dates.length) return null;
+  const summary = dates.length === 1
+    ? `Seen open ${fmtDate(dates[0])}`
+    : `Open on ${dates.length} visits · first ${fmtShort(dates[0])} · last ${fmtShort(dates[dates.length - 1])}`;
+  return (
+    <div
+      style={{ ...S.metaTxt, cursor: "pointer", userSelect: "none", WebkitUserSelect: "none", touchAction: "manipulation" }}
+      onClick={() => setOpen(v => !v)}
+    >
+      {summary}{dates.length > 1 ? (open ? " ▴" : " ▾") : ""}
+      {open && dates.length > 1 && <div style={{ marginTop: 3 }}>{dates.map(fmtShort).join(", ")}</div>}
+    </div>
+  );
+}
+
+function FlaggedRow({ item, onResolve, trail }) {
   const [reassign, setReassign] = useState("");
   return (
     <div style={{ ...S.itemRow, borderColor: "rgba(245,158,11,0.3)", backgroundColor: "rgba(245,158,11,0.05)" }}>
       <div style={S.itemText}>{item.room}: {item.item}</div>
       <div style={S.metaTxt}>Currently: {item.assignee}</div>
+      <OpenTrail dates={trail} />
       <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
         <input style={{ ...S.tIn, flex: 1 }} placeholder="Reassign to…" value={reassign} onChange={e => setReassign(e.target.value)} />
         <button style={S.gBtn} disabled={!reassign.trim()} onClick={() => onResolve(item, reassign.trim())}>RESOLVE</button>
