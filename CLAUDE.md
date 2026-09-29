@@ -166,8 +166,14 @@ Overdue rule, counted in **workdays (Mon–Fri)**, never flagged Sat/Sun:
 >14 days to closing or no date → 3+; 8–14 → 2+; ≤7 → 1+ (i.e. not visited today).
 It's a badge only — **it never changes sort order.** In the app an item's trail is
 a summary ("Open on N visits · first · last"), full list one tap away; the `.md`
-archive prints every date. Next planned step: PunchTrack as the Punch tab inside
-BuildTrackUnified (Part 1 of that spec).
+archive prints every date.
+
+### Embedded in BuildTrackUnified (2026-09-29)
+BuildTrackUnified's Punch tab calls this backend directly (Part 1 of the spec) —
+same token, same sheet, no data copied. `listJobs` returns per-house
+`total`/`done`/`open` counts for its rings; don't remove them. Its front end
+mirrors this one's rules (Prieb aliases, overdue rule, report deadline) — change
+both together. This standalone page stays live for a trial period, then retires.
 
 ### Security status — has auth and rate limiting
 - `checkToken()` is enforced on every GET/POST action.

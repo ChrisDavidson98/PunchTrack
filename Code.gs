@@ -306,7 +306,19 @@ function dayKey(v) {
 function listJobs() {
   const sh = getSheet(JOBS_SHEET, JOBS_HEADERS);
   const last = lastVisitBySlug();
-  return sheetToObjects(sh).map(j => ({ ...j, lastVisit: last[j.slug] || '' })).sort((a, b) => {
+  // Per-house counts ride along so a dashboard (BuildTrackUnified's Punch tab and
+  // rings) can show progress for every house from this one call, instead of one
+  // getJob per house — which would trip the 60-reads-per-minute limit.
+  const counts = {};
+  sheetToObjects(getSheet(ITEMS_SHEET, ITEMS_HEADERS)).forEach(it => {
+    const c = counts[it.slug] = counts[it.slug] || { total: 0, done: 0 };
+    c.total++;
+    if (it.status === 'completed') c.done++;
+  });
+  return sheetToObjects(sh).map(j => {
+    const c = counts[j.slug] || { total: 0, done: 0 };
+    return { ...j, lastVisit: last[j.slug] || '', total: c.total, done: c.done, open: c.total - c.done };
+  }).sort((a, b) => {
     const ka = closingKey(a), kb = closingKey(b);
     if (ka && kb) return ka < kb ? -1 : ka > kb ? 1 : 0;
     if (ka) return -1;
