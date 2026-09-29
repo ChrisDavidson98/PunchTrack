@@ -34,8 +34,7 @@ anything not confirmed is listed under **Open questions** — don't guess those.
   spec is the later merge pass that lifts that.
 
 ### Practical note
-This session has read-only access to BuildTrackUnified. Building Part 1 needs push
-access to that repo (or a separate session opened on it).
+Push access to BuildTrackUnified was attached to the 2026-09-29 session.
 
 ---
 
@@ -82,13 +81,12 @@ For each item, the visits where it was still open ("still open on 9/19, 9/23, 9/
 
 ---
 
-## Open questions (ask Chris, don't assume)
-- Which statuses count as "still open" on a visit — all non-completed
-  (assignable, sent, flagged, self_assigned, Prieb items), or only some?
-- Exact "Checked today" button placement and label.
-- Suggested build order: Part 2 in PunchTrack first (backend + standalone page),
-  then Part 1 in BuildTrackUnified so the tab ships with visits already working.
-  Confirm.
+## Resolved 2026-09-29
+- "Still open" on a visit = **every item not `completed`** (assignable, sent,
+  flagged, self_assigned, Prieb — all of them).
+- "Checked today" button goes **near the top of the house screen**; label TBD at
+  build time, not a big deal to Chris.
+- **Build order:** Part 2 in PunchTrack first, then Part 1 in BuildTrackUnified.
 
 Reminder: any `Code.gs` change must be pasted into the Apps Script editor and
 redeployed before it takes effect.
